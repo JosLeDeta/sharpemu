@@ -806,9 +806,14 @@ public static class KernelPthreadCompatExports
         }
 
         var attr = ResolveMutexAttrState(ctx, attrAddress);
+        // RDR re-enters a NULL-attribute mutex through nested lock wrappers.
+        // Keep this compatibility experiment opt-in until the platform default
+        // is verified independently; explicit attributes retain their semantics.
+        var recursiveDefault = attrAddress == 0 &&
+            Environment.GetEnvironmentVariable("SHARPEMU_DEFAULT_MUTEX_RECURSIVE") == "1";
         var state = new PthreadMutexState
         {
-            Type = attr.Type,
+            Type = recursiveDefault ? MutexTypeRecursive : attr.Type,
             Protocol = attr.Protocol,
         };
 

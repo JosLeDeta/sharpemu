@@ -95,8 +95,48 @@ public sealed class PthreadMutexExceptionTests
 
 }
 
+[Collection("SaveDataMemoryState")]
 public sealed class PthreadMutexSemanticsTests
 {
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void RecursiveDefaultOverrideRespectsExplicitAttributes(bool enabled, bool explicitAttribute)
+    {
+        var previous = Environment.GetEnvironmentVariable("SHARPEMU_DEFAULT_MUTEX_RECURSIVE");
+        try
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_DEFAULT_MUTEX_RECURSIVE", enabled ? "1" : null);
+            const ulong memoryBase = 0x6_0000_0000;
+            var ctx = new CpuContext(new AllocatingCpuMemory(memoryBase, 0x4000), Generation.Gen5);
+            var attribute = memoryBase + 0x100;
+            var mutex = memoryBase + 0x200;
+            if (explicitAttribute)
+            {
+                ctx[CpuRegister.Rdi] = attribute;
+                Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexattrInit(ctx));
+            }
+            ctx[CpuRegister.Rdi] = mutex;
+            ctx[CpuRegister.Rsi] = explicitAttribute ? attribute : 0;
+            Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexInit(ctx));
+            Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(ctx));
+            var recursive = enabled && !explicitAttribute;
+            Assert.Equal(recursive ? 0 : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK,
+                KernelPthreadCompatExports.PthreadMutexLock(ctx));
+            Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(ctx));
+            if (recursive)
+            {
+                Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(ctx));
+            }
+            Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexDestroy(ctx));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_DEFAULT_MUTEX_RECURSIVE", previous);
+        }
+    }
+
     [Fact]
     public void AdaptiveMutex_SelfLockIsIdempotent()
     {
