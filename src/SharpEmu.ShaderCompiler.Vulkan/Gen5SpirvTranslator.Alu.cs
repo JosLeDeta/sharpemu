@@ -4276,19 +4276,8 @@ public static partial class Gen5SpirvTranslator
             uint value)
         {
             var control = instruction.Control as Gen5Vop3Control;
-            value = (control?.OutputModifier ?? 0) switch
-            {
-                1 => _module.AddInstruction(SpirvOp.FMul, _floatType, value, Float(2)),
-                2 => _module.AddInstruction(SpirvOp.FMul, _floatType, value, Float(4)),
-                3 => _module.AddInstruction(SpirvOp.FMul, _floatType, value, Float(0.5f)),
-                _ => value,
-            };
-            if (control?.Clamp == true)
-            {
-                value = Ext(43, _floatType, value, Float(0), Float(1));
-            }
-
-            var half = EmitFloatToHalf(Bitcast(_uintType, value));
+            // SDWA and VOP3 apply output scaling and saturation before narrowing.
+            var half = EmitFloatToHalf(EmitFloatResult(instruction, value));
             var current = LoadV(destination);
             return ((control?.OperandSelect ?? 0) & 8) != 0
                 ? BitwiseOr(

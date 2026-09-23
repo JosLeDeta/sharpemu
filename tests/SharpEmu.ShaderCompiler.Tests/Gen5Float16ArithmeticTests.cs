@@ -15,6 +15,36 @@ public sealed class Gen5Float16ArithmeticTests
     private const uint SEndpgm = 0xBF810000;
 
     [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void GlassHalfMaxSdwaHonorsSaturation(bool clamp)
+    {
+        // RDR glass pixel shader: max(0, s106), with a half-infinity source.
+        var program = Decode([0x7216D4F9u, clamp ? 0x86862680u : 0x86860680u, SEndpgm]);
+        Assert.Equal("VMaxF16", program.Instructions[0].Opcode);
+        Assert.Equal(clamp, Assert.IsType<Gen5SdwaControl>(program.Instructions[0].Control).Clamp);
+
+        var request = ResourceTestProgram.Request(program, userDataCount: 0);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var words = new uint[shader.Spirv.Length / 4];
+        for (var i = 0; i < words.Length; i++)
+            words[i] = BinaryPrimitives.ReadUInt32LittleEndian(shader.Spirv.AsSpan(i * 4));
+
+        uint maxResult = 0;
+        var clampedMax = false;
+        for (var i = 5; i < words.Length; i += (int)(words[i] >> 16))
+        {
+            if ((ushort)words[i] != (ushort)SpirvOp.ExtInst) continue;
+            if (words[i + 4] == 40) maxResult = words[i + 2];
+            if (words[i + 4] == 43 && words[i + 5] == maxResult && maxResult != 0)
+                clampedMax = true;
+        }
+
+        Assert.NotEqual(0u, maxResult);
+        Assert.Equal(clamp, clampedMax);
+    }
+
+    [Theory]
     [InlineData(0x351u, "VMin3F16")]
     [InlineData(0x354u, "VMax3F16")]
     [InlineData(0x357u, "VMed3F16")]
