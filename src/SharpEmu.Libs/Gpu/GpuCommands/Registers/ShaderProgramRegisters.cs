@@ -180,6 +180,8 @@ public struct GeometryResource2
 public sealed class VertexStageRegisters
 {
     public ulong ExportAddress;
+    public uint ExportResource1;
+    public uint ExportResource2;
     public ulong LocalAddress;
     public ulong HullAddress;
     public HullResource1 HullResource1;

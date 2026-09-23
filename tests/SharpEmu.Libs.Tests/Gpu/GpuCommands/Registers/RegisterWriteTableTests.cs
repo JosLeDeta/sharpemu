@@ -216,6 +216,17 @@ public sealed class RegisterWriteTableTests
         Assert.Contains("table=0x0000000000005000", error.Message);
     }
 
+    [Fact]
+    public void ExportShaderResourceRegisters_AcceptAgcTableEntries()
+    {
+        var banks = NewBanks();
+        RegisterWriteTable.WriteShaderEntry(banks, SpiShaderPgmRsrc1Es, 0x0300_0002, 0x5000);
+        RegisterWriteTable.WriteShaderEntry(banks, SpiShaderPgmRsrc2Es, 0x0000_0040, 0x5000);
+
+        Assert.Equal(0x0300_0002u, banks.Shader.Vertex.ExportResource1);
+        Assert.Equal(0x0000_0040u, banks.Shader.Vertex.ExportResource2);
+    }
+
     // Registers without a decoded field are stored so a title that writes them does not stop.
     [Fact]
     public void RegistersWithoutAReferenceEntry_AreStored()
