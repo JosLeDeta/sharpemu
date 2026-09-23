@@ -9,7 +9,7 @@ using System.Threading;
 
 namespace SharpEmu.Libs.Ngs2;
 
-public static class Ngs2Exports
+public static partial class Ngs2Exports
 {
     private const int OrbisNgs2ErrorInvalidOutAddress = unchecked((int)0x804A0053);
     private const int OrbisNgs2ErrorInvalidSystemHandle = unchecked((int)0x804A0230);
