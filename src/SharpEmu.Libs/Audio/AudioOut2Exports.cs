@@ -85,22 +85,35 @@ public static class AudioOut2Exports
         public uint Frequency { get; }
         public uint GrainSamples { get; }
         public uint QueueDepth { get; }
-        public IHostAudioStream? Backend { get; }
+        public IHostAudioStream? Backend { get; set; }
 
         public void PaceAdvance()
         {
+            var queuedMilliseconds = Backend?.QueuedMilliseconds ?? -1;
+            if (queuedMilliseconds >= 0)
+            {
+                var delayMilliseconds = GetQueuePacingDelayMilliseconds(
+                    queuedMilliseconds, GrainSamples, Frequency, QueueDepth);
+                if (delayMilliseconds > 0)
+                {
+                    Thread.Sleep(TimeSpan.FromMilliseconds(delayMilliseconds));
+                }
+                return;
+            }
+
             long delay;
             lock (_paceGate)
             {
                 var now = Stopwatch.GetTimestamp();
-                if (_nextAdvanceTimestamp < now)
+                var period = checked(
+                    (long)Math.Ceiling(Stopwatch.Frequency * (double)GrainSamples / Frequency));
+                if (_nextAdvanceTimestamp == 0 || now - _nextAdvanceTimestamp > period * QueueDepth)
                 {
                     _nextAdvanceTimestamp = now;
                 }
 
                 delay = _nextAdvanceTimestamp - now;
-                _nextAdvanceTimestamp += checked(
-                    (long)Math.Ceiling(Stopwatch.Frequency * (double)GrainSamples / Frequency));
+                _nextAdvanceTimestamp += period;
             }
 
             if (delay > 0)
@@ -109,6 +122,10 @@ public static class AudioOut2Exports
             }
         }
     }
+
+    internal static double GetQueuePacingDelayMilliseconds(
+        int queuedMilliseconds, uint grainSamples, uint frequency, uint queueDepth) =>
+        Math.Max(0, queuedMilliseconds - 1000.0 * grainSamples * queueDepth / frequency);
 
     private sealed class PortState
     {
@@ -982,6 +999,7 @@ public static class AudioOut2Exports
                         $"ports={mixedPorts} peak={peak:F4} backend={backendName}");
                 }
 
+                context.Backend = backend;
                 return backend.Submit(outputSpan);
             }
             finally
