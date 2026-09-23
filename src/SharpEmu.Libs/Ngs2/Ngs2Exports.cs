@@ -834,8 +834,8 @@ public static partial class Ngs2Exports
             }
         }
 
-        // No flags set: voice is idle.
-        if (flagsAddress != 0 && !ctx.TryWriteUInt64(flagsAddress, 0))
+        // The output is uint32_t; a wider store overwrites adjacent guest data.
+        if (flagsAddress != 0 && !ctx.TryWriteUInt32(flagsAddress, 0))
         {
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
