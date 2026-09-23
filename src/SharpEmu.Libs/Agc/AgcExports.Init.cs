@@ -244,11 +244,8 @@ public static partial class AgcExports
                 internalDefaults = InternalRegisterDefaultsVersion11;
                 return true;
             case RegisterDefaultsVersion13 when !IsLegacyVersion13RegisterDefaultsRequested():
-                // The exact version 13 data is not available. The available
-                // open-source table uses version 11 for newer requests. Local
-                // Astro Bot tests found no regression with this fallback.
-                publicDefaults = PublicRegisterDefaultsVersion11;
-                internalDefaults = InternalRegisterDefaultsVersion11;
+                publicDefaults = PublicRegisterDefaultsVersion13;
+                internalDefaults = InternalRegisterDefaultsVersion13;
                 return true;
             default:
                 publicDefaults = null!;

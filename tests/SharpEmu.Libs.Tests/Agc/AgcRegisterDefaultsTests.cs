@@ -195,7 +195,7 @@ public sealed class AgcRegisterDefaultsTests
     }
 
     [Fact]
-    public void GetRegisterDefaults2_Version13_UsesVersion11ByDefault()
+    public void GetRegisterDefaults2_Version13_UsesVersion13BlendGroup()
     {
         const string variable = "SHARPEMU_AGC_VERSION13_DEFAULTS";
         var original = Environment.GetEnvironmentVariable(variable);
@@ -210,8 +210,9 @@ public sealed class AgcRegisterDefaultsTests
             var address = ctx[CpuRegister.Rax];
 
             Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, result);
-            Assert.Equal(488u, ReadUInt32(memory, address + 0x20));
-            Assert.Equal(137u, ReadUInt32(memory, address + 0x38));
+            var contextTable = ReadUInt64(memory, address);
+            var blendGroup = ReadUInt64(memory, contextTable + 65 * 8);
+            AssertRegister(memory, blendGroup, 0x01E0, 0x20010001);
         }
         finally
         {
