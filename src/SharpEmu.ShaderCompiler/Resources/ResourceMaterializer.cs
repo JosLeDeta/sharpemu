@@ -247,7 +247,7 @@ public static class ResourceMaterializer
                 if (!evaluator.Evaluate(source.Dwords[dword], out _))
                 {
                     return $"descriptor source {sourceIndex} dword {dword} cannot be evaluated: " +
-                        DescribeEvaluationValue(plan, inputs, evaluator, source.Dwords[dword]);
+                        DescribeFailedDependency(plan, inputs, evaluator, source.Dwords[dword]);
                 }
             }
         }
@@ -260,11 +260,42 @@ public static class ResourceMaterializer
             if (read.FlatOffset >= plan.TableReads.Count || !selected.Evaluate(read.Value, out _))
             {
                 return $"resource table read {read.FlatOffset} cannot be evaluated: " +
-                    DescribeEvaluationValue(plan, inputs, selected, read.Value);
+                    DescribeFailedDependency(plan, inputs, selected, read.Value);
             }
         }
 
         return "descriptor snapshot evaluation failed without an isolated source";
+    }
+
+    private static string DescribeFailedDependency(
+        ShaderResourcePlan plan, ResourceRuntimeInputs inputs, RuntimeValueEvaluator evaluator, ScalarValue value)
+    {
+        var visited = new HashSet<ScalarValue>();
+        for (var depth = 0; depth < 32 && visited.Add(value); depth++)
+        {
+            if (value.Kind == ScalarValueKind.Phi)
+            {
+                var invariant = plan.Graph.ResolveInvariantPhi(value);
+                if (invariant is null) return $"non-invariant Phi#{value.Id} block={value.PhiBlock}";
+                value = invariant;
+                continue;
+            }
+
+            if (value.Kind == ScalarValueKind.ResourceTableWord && value.Payload < (ulong)plan.TableReads.Count)
+            {
+                value = plan.TableReads[(int)value.Payload].Value;
+                continue;
+            }
+
+            if (value.Kind is ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord)
+                return DescribeEvaluationValue(plan, inputs, evaluator, value, depth: 3);
+
+            var failing = value.Operands.FirstOrDefault(operand => !evaluator.EvaluateWide(operand, out _));
+            if (failing is null) return $"{value.Kind}#{value.Id} operation={value.Operation} failed";
+            value = failing;
+        }
+
+        return $"{value.Kind}#{value.Id} evaluation cycle or depth limit";
     }
 
     private static string DescribeEvaluationValue(
