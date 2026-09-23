@@ -6,10 +6,15 @@ namespace SharpEmu.Libs.Gpu.Scheduling;
 public sealed class TickTimeline
 {
     private readonly IGpuTickDevice _device;
+    private readonly Action<ulong, string>? _waitFailed;
     private ulong _gpuTick;
     private ulong _currentTick = 1;
 
-    public TickTimeline(IGpuTickDevice device) => _device = device;
+    public TickTimeline(IGpuTickDevice device, Action<ulong, string>? waitFailed = null)
+    {
+        _device = device;
+        _waitFailed = waitFailed;
+    }
 
     public ulong CurrentTick => Volatile.Read(ref _currentTick);
 
@@ -52,6 +57,7 @@ public sealed class TickTimeline
 
         if (!_device.TryWaitTimeline(tick, out var failure))
         {
+            _waitFailed?.Invoke(tick, failure);
             throw SubmissionScheduler.Fatal($"vkWaitSemaphores failed: {failure}, tick={tick}");
         }
 

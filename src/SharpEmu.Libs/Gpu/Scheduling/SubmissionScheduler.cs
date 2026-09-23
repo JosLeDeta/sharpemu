@@ -25,6 +25,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     private readonly SubmissionTraceEntry[] _submissionHistory = new SubmissionTraceEntry[32];
     private int _nextSubmissionHistoryIndex;
     private int _submissionHistoryCount;
+    private int _reportedWaitFailure;
 
     private readonly IGpuTickDevice _device;
     private readonly TickTimeline _timeline;
@@ -57,7 +58,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         _prepareSubmit = prepareSubmit;
         _submitted = submitted;
         _completed = completed;
-        _timeline = new TickTimeline(device);
+        _timeline = new TickTimeline(device, ReportWaitFailure);
         _ring = new TickedBufferRing(device, _timeline);
         _command = new RecordingBuffer(this, device, rendering);
         _priorityThread = new Thread(RunPriorityWorker) { IsBackground = true, Name = "SharpEmu GPU priority" };
@@ -488,6 +489,18 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             yield return $"tick={entry.Tick} op={(RecordedOperation)entry.Op} submit={entry.SubmitId} " +
                 $"args={entry.Arg0},{entry.Arg1},{entry.Arg2},{entry.Arg3},0x{entry.Arg4:X16}";
         }
+    }
+
+    private void ReportWaitFailure(ulong tick, string failure)
+    {
+        if (Interlocked.Exchange(ref _reportedWaitFailure, 1) != 0)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine($"[GPU][ERROR] timeline wait failed: {failure} tick={tick} known_completed_tick={_timeline.CompletedTick}");
+        foreach (var entry in FormatRecentSubmissions())
+            Console.Error.WriteLine($"[GPU][ERROR] {entry}");
     }
 
     private void RunPriorityWorker()
