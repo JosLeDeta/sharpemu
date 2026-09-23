@@ -292,6 +292,43 @@ public static partial class Gen5SpirvTranslator
                         destination,
                         Ext(32, _floatType, GetFloat16Source(instruction, 0)));
                     break;
+                case "VSqrtF16":
+                case "VLogF16":
+                case "VExpF16":
+                case "VFloorF16":
+                case "VCeilF16":
+                case "VTruncF16":
+                case "VRndneF16":
+                case "VFractF16":
+                {
+                    var argument = GetFloat16Source(instruction, 0);
+                    var operation = instruction.Opcode switch
+                    {
+                        "VSqrtF16" => 31u,
+                        "VLogF16" => 30u,
+                        "VExpF16" => 29u,
+                        "VFloorF16" => 8u,
+                        "VCeilF16" => 9u,
+                        "VTruncF16" => 3u,
+                        "VRndneF16" => 2u,
+                        _ => 10u,
+                    };
+                    uint value;
+                    if (instruction.Opcode is "VSqrtF16" or "VLogF16")
+                    {
+                        var negative = _module.AddInstruction(SpirvOp.FOrdLessThan, _boolType, argument, Float(0));
+                        var safe = _module.AddInstruction(SpirvOp.Select, _floatType, negative, Float(0), argument);
+                        var clamped = instruction.Control is Gen5Vop3Control { Clamp: true } or Gen5SdwaControl { Clamp: true };
+                        var invalid = clamped ? Float(0) : Bitcast(_floatType, UInt(0xFFC00000));
+                        value = _module.AddInstruction(SpirvOp.Select, _floatType, negative, invalid, Ext(operation, _floatType, safe));
+                    }
+                    else
+                    {
+                        value = Ext(operation, _floatType, argument);
+                    }
+                    result = EmitFloat16Result(instruction, destination, value);
+                    break;
+                }
                 case "VFractF32":
                     result = EmitFloatResult(
                         instruction,
@@ -432,6 +469,27 @@ public static partial class Gen5SpirvTranslator
                 case "VMax3F32":
                     result = EmitFloatTernaryExt(instruction, 40);
                     break;
+                case "VMin3F16":
+                case "VMax3F16":
+                case "VMed3F16":
+                {
+                    var a = GetFloat16Source(instruction, 0);
+                    var b = GetFloat16Source(instruction, 1);
+                    var c = GetFloat16Source(instruction, 2);
+                    var maximum = instruction.Opcode == "VMax3F16";
+                    var value = EmitPackedF16MinMax(EmitPackedF16MinMax(a, b, maximum), c, maximum);
+                    if (instruction.Opcode == "VMed3F16")
+                    {
+                        var lo = EmitPackedF16MinMax(a, b, false);
+                        var hi = EmitPackedF16MinMax(a, b, true);
+                        value = EmitPackedF16MinMax(lo, EmitPackedF16MinMax(hi, c, false), true);
+                    }
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        value);
+                    break;
+                }
                 case "VAndB32":
                     result = EmitIntegerBinary(instruction, SpirvOp.BitwiseAnd);
                     break;
@@ -1901,6 +1959,7 @@ public static partial class Gen5SpirvTranslator
                     "VCmpNeI16" or "VCmpxNeI16" => SpirvOp.INotEqual,
                     "VCmpNeU64" or "VCmpxNeU64" or
                     "VCmpNeI64" or "VCmpxNeI64" => SpirvOp.INotEqual,
+                    "VCmpGtU64" => SpirvOp.UGreaterThan,
                     "VCmpLtI16" or "VCmpxLtI16" => SpirvOp.SLessThan,
                     "VCmpLeI16" or "VCmpxLeI16" => SpirvOp.SLessThanEqual,
                     "VCmpGtI16" or "VCmpxGtI16" => SpirvOp.SGreaterThan,

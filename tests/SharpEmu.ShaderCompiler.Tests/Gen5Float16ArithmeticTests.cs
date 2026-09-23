@@ -14,6 +14,49 @@ public sealed class Gen5Float16ArithmeticTests
     private const ulong ShaderAddress = 0x1_0000_0000;
     private const uint SEndpgm = 0xBF810000;
 
+    [Theory]
+    [InlineData(0x351u, "VMin3F16")]
+    [InlineData(0x354u, "VMax3F16")]
+    [InlineData(0x357u, "VMed3F16")]
+    public void HalfThreeSourceOperationsDecodeAndCompile(uint opcode, string name)
+    {
+        var program = Decode([(0x35u << 26) | (opcode << 16), 0x040A0300, SEndpgm]);
+        Assert.Equal(name, program.Instructions[0].Opcode);
+
+        var request = ResourceTestProgram.Request(program, userDataCount: 0);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        Assert.Contains((ushort)(opcode == 0x351u ? SpirvOp.FOrdLessThan : SpirvOp.FOrdGreaterThan),
+            ReadOpcodes(shader.Spirv));
+        Assert.DoesNotContain((ushort)SpirvCapability.Float16, ReadCapabilities(shader.Spirv));
+    }
+
+    [Theory]
+    [InlineData(0x54u, "VRcpF16")]
+    [InlineData(0x55u, "VSqrtF16")]
+    [InlineData(0x56u, "VRsqF16")]
+    [InlineData(0x57u, "VLogF16")]
+    [InlineData(0x58u, "VExpF16")]
+    [InlineData(0x5Bu, "VFloorF16")]
+    [InlineData(0x5Cu, "VCeilF16")]
+    [InlineData(0x5Du, "VTruncF16")]
+    [InlineData(0x5Eu, "VRndneF16")]
+    [InlineData(0x5Fu, "VFractF16")]
+    public void HalfUnaryCompactAndExtendedFormsCompile(uint opcode, string name)
+    {
+        foreach (var words in new uint[][]
+        {
+            [0x7E000100u | (opcode << 9), SEndpgm],
+            [0xD4000000u | ((opcode + 0x180) << 16), 0x100, SEndpgm],
+        })
+        {
+            var program = Decode(words);
+            Assert.Equal(name, program.Instructions[0].Opcode);
+            var request = ResourceTestProgram.Request(program, userDataCount: 0);
+            Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+            Assert.DoesNotContain((ushort)SpirvCapability.Float16, ReadCapabilities(shader.Spirv));
+        }
+    }
+
     [Fact]
     public void CompactFloat16ArithmeticDecodesAndCompilesWithoutNativeFloat16()
     {
