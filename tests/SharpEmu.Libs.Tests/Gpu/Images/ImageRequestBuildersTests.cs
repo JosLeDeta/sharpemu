@@ -184,6 +184,21 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
         Assert.Equal(2u, request.View.LevelCount);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Texture_ViewBeyondAllocatedMipsUsesTheLastAvailableLevel(bool dynamicMip)
+    {
+        var words = RegisterWords.Texture(Base, GuestPixelFormat.Bits8_8_8_8UNorm, 64, 64,
+            baseLevel: 6, lastLevel: 6, maxMip: 5);
+        var shape = Sampled2D with { Storage = true, DynamicMip = dynamicMip };
+        var request = ImageRequestBuilders.Texture(words, shape).Request;
+
+        Assert.Equal(6u, request.Description.Resources.Levels);
+        Assert.Equal(5u, request.View.BaseLevel);
+        Assert.Equal(1u, request.View.LevelCount);
+    }
+
     [Fact]
     public void Texture_CubeBecomesALayeredTwoDimensionalImage()
     {

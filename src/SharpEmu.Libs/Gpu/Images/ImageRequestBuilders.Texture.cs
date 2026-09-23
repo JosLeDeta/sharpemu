@@ -97,13 +97,13 @@ public static partial class ImageRequestBuilders
 
     // The view follows the compiled module: a volume, a layer window to the last layer, or one layer.
     private static ImageViewDescription TextureView(
-        in TextureDescriptorWords descriptor, in ShaderImageShape shape, Format format, bool shaderConversion, uint viewLevels, uint imageLayers)
+        in TextureDescriptorWords descriptor, in ShaderImageShape shape, Format format, bool shaderConversion, uint baseLevel, uint viewLevels, uint imageLayers)
     {
         var mapping = shape.Storage || shaderConversion ? default : ViewFormatRules.ComponentMapping(DestinationSwizzle(descriptor));
         var usage = shape.Storage ? ImageUsageFlags.StorageBit : ImageUsageFlags.SampledBit;
         if (shape.Volume)
         {
-            return new ImageViewDescription(format, ImageViewType.Type3D, ImageAspectFlags.ColorBit, descriptor.BaseLevel, viewLevels, 0, 1, mapping, usage);
+            return new ImageViewDescription(format, ImageViewType.Type3D, ImageAspectFlags.ColorBit, baseLevel, viewLevels, 0, 1, mapping, usage);
         }
 
         var baseLayer = descriptor.BaseArray;
@@ -116,7 +116,7 @@ public static partial class ImageRequestBuilders
         var type = shape.OneDimensional
             ? shape.Arrayed ? ImageViewType.Type1DArray : ImageViewType.Type1D
             : shape.Arrayed ? ImageViewType.Type2DArray : ImageViewType.Type2D;
-        return new ImageViewDescription(format, type, ImageAspectFlags.ColorBit, descriptor.BaseLevel, viewLevels, baseLayer, layerCount, mapping, usage);
+        return new ImageViewDescription(format, type, ImageAspectFlags.ColorBit, baseLevel, viewLevels, baseLayer, layerCount, mapping, usage);
     }
 
     public static uint DestinationSwizzle(in TextureDescriptorWords descriptor) =>
@@ -156,13 +156,17 @@ public static partial class ImageRequestBuilders
         var multisampled = IsMultisampledTexture(type);
         var maxMip = shape.R128 ? lastLevel : descriptor.MaxMip;
         var levels = multisampled ? 1 : maxMip + 1;
+        // Clamp an out-of-range view to the last mip in the allocation.
+        var viewBaseLevel = Math.Min(baseLevel, levels - 1);
         var dynamicStorage = storage && shape.DynamicMip;
         var viewLastLevel = !multisampled && !dynamicStorage ? Math.Min(lastLevel, maxMip) : lastLevel;
+        if (viewBaseLevel != baseLevel)
+            viewLastLevel = Math.Min(viewLastLevel, maxMip);
         var tile = descriptor.TileMode;
         var depthTile = tile == GuestTileMode.Depth;
         var msaaTile = depthTile || tile == GuestTileMode.RenderTarget;
         var msaaArray = type == GuestImageType.Color2DMsaaArray;
-        if ((!multisampled && (baseLevel > viewLastLevel || viewLastLevel >= levels)) ||
+        if ((!multisampled && (viewBaseLevel > viewLastLevel || viewLastLevel >= levels)) ||
             (multisampled &&
              (baseLevel != 0 || lastLevel == 0 || lastLevel > 3 || maxMip != lastLevel || !msaaTile || (descriptor.MsaaDepth && !depthTile) ||
               (!msaaArray && (descriptor.Depth != 0 || descriptor.BaseArray != 0)))))
@@ -173,7 +177,7 @@ public static partial class ImageRequestBuilders
         }
 
         var samples = multisampled ? 1u << (int)lastLevel : 1u;
-        var viewLevels = multisampled ? 1 : viewLastLevel - baseLevel + 1;
+        var viewLevels = multisampled ? 1 : viewLastLevel - viewBaseLevel + 1;
         var depth = descriptor.Depth + 1;
         var format = descriptor.Format;
         var surfaceFormat = TextureTransferLayout.SurfaceFormat(format);
@@ -243,7 +247,7 @@ public static partial class ImageRequestBuilders
             PopulateTextureMipLayout(ref description);
         }
 
-        var view = TextureView(descriptor, shape, viewFormat, shaderConversion, viewLevels, description.Resources.Layers);
+        var view = TextureView(descriptor, shape, viewFormat, shaderConversion, viewBaseLevel, viewLevels, description.Resources.Layers);
         var request = new ImageRequest(description, view, storage ? ImageRole.StorageImage : ImageRole.Texture);
         return new TextureRequestResolution(request, shaderConversion, pixelFormat, DestinationSwizzle(descriptor));
     }
