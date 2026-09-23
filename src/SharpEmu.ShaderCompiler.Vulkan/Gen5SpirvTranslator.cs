@@ -1761,14 +1761,6 @@ public static partial class Gen5SpirvTranslator
             var active = Load(_boolType, _exec);
 
             var activeMask = BooleanToWaveMask(active);
-            var activeCount64 = _module.AddInstruction(
-                SpirvOp.BitCount,
-                _ulongType,
-                activeMask);
-            var activeCount = _module.AddInstruction(
-                SpirvOp.UConvert,
-                _uintType,
-                activeCount64);
             var activeLow = _module.AddInstruction(
                 SpirvOp.UConvert,
                 _uintType,
@@ -1779,6 +1771,9 @@ public static partial class Gen5SpirvTranslator
                 ShiftRightLogical64(
                     activeMask,
                     _module.Constant64(_ulongType, 32)));
+            var activeCount = IAdd(
+                _module.AddInstruction(SpirvOp.BitCount, _uintType, activeLow),
+                _module.AddInstruction(SpirvOp.BitCount, _uintType, activeHigh));
             var firstLane = _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,

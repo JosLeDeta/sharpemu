@@ -14,6 +14,7 @@ internal sealed class SpirvModuleInspector
     public Dictionary<uint, uint> DescriptorSets { get; } = [];
     public HashSet<uint> Capabilities { get; } = [];
     public HashSet<ushort> Opcodes { get; } = [];
+    public List<uint> BitCountResultWidths { get; } = [];
     public Dictionary<uint, uint> VariableStorageClasses { get; } = [];
     public uint AddressingModel { get; private set; }
 
@@ -22,6 +23,7 @@ internal sealed class SpirvModuleInspector
         var words = new uint[spirv.Length / 4];
         Buffer.BlockCopy(spirv, 0, words, 0, spirv.Length);
         var offset = 5;
+        var integerWidths = new Dictionary<uint, uint>();
         while (offset < words.Length)
         {
             var wordCount = (int)(words[offset] >> 16);
@@ -40,6 +42,12 @@ internal sealed class SpirvModuleInspector
                     break;
                 case SpirvOp.Capability:
                     Capabilities.Add(words[offset + 1]);
+                    break;
+                case SpirvOp.TypeInt:
+                    integerWidths[words[offset + 1]] = words[offset + 2];
+                    break;
+                case SpirvOp.BitCount:
+                    BitCountResultWidths.Add(integerWidths[words[offset + 1]]);
                     break;
                 case SpirvOp.MemoryModel:
                     AddressingModel = words[offset + 1];

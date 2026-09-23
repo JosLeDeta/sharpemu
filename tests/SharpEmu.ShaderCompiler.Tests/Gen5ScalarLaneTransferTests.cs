@@ -99,6 +99,8 @@ public sealed class Gen5ScalarLaneTransferTests
         Assert.Contains((ushort)SpirvOp.Select, opcodes);
         Assert.Contains((ushort)SpirvOp.IMul, opcodes);
         Assert.Contains((ushort)SpirvOp.BitCount, opcodes);
+        Assert.All(new SpirvModuleInspector(compiled.Spirv).BitCountResultWidths,
+            width => Assert.Equal(32u, width));
     }
 
     [Fact]

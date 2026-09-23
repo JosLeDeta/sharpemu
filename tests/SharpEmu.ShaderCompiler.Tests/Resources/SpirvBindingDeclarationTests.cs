@@ -379,6 +379,8 @@ public sealed class SpirvBindingDeclarationTests
         var module = new SpirvModuleInspector(shader.Spirv);
         Assert.Contains((ushort)SpirvOp.GroupNonUniformShuffle, module.Opcodes);
         Assert.Contains((uint)SpirvCapability.GroupNonUniformShuffle, module.Capabilities);
+        Assert.NotEmpty(module.BitCountResultWidths);
+        Assert.All(module.BitCountResultWidths, width => Assert.Equal(32u, width));
     }
 
     // A storage image whose descriptor spans two mips, written through a register-selected mip.
