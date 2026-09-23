@@ -449,12 +449,17 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
+	internal static bool IsAuxiliaryExecuteAccessViolation(uint code, uint parameterCount, ulong accessType) =>
+		code == 0xC0000005u && parameterCount >= 2 && accessType == 8;
+
 	private unsafe bool TryRecoverAuxiliaryThreadExecuteFault(
 		EXCEPTION_RECORD* exceptionRecord,
 		void* contextRecord,
 		ulong rip)
 	{
-		if (exceptionRecord->ExceptionCode != 3221225477u)
+		if (!IsAuxiliaryExecuteAccessViolation(
+			exceptionRecord->ExceptionCode, exceptionRecord->NumberParameters,
+			exceptionRecord->NumberParameters >= 1 ? exceptionRecord->ExceptionInformation[0] : 0))
 		{
 			return false;
 		}
