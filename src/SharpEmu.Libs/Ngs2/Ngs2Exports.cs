@@ -67,6 +67,27 @@ public static partial class Ngs2Exports
         public float Gain { get; set; } = 1f;
     }
 
+    [SysAbiExport(Nid = "AQkj7C0f3PY", ExportName = "sceNgs2SystemResetOption",
+        Target = Generation.Gen5, LibraryName = "libSceNgs2")]
+    public static int Ngs2SystemResetOption(CpuContext ctx)
+    {
+        var address = ctx[CpuRegister.Rdi];
+        if (address == 0)
+        {
+            return SetReturn(ctx, OrbisNgs2ErrorInvalidOutAddress);
+        }
+
+        // The PS5 option occupies 144 bytes; initialize the entire structure.
+        Span<byte> option = stackalloc byte[144];
+        option.Clear();
+        BinaryPrimitives.WriteUInt64LittleEndian(option, (ulong)option.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(option[108..], 512);
+        BinaryPrimitives.WriteUInt32LittleEndian(option[112..], DefaultGrainSamples);
+        BinaryPrimitives.WriteUInt32LittleEndian(option[116..], DefaultSampleRate);
+        return SetReturn(ctx, ctx.Memory.TryWrite(address, option) ? 0 :
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
     [SysAbiExport(
         Nid = "mPYgU4oYpuY",
         ExportName = "sceNgs2SystemCreateWithAllocator",
