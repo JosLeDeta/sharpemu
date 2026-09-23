@@ -12,6 +12,23 @@ namespace SharpEmu.ShaderCompiler.Tests;
 
 public sealed class Gen5DataShareRead64Tests
 {
+    [Theory]
+    [InlineData(0xD8FA0010u, true)]
+    [InlineData(0xD8F90010u, false)]
+    public void EncodedAppendUsesBit17ForGlobalDataShare(uint word, bool global)
+    {
+        var memory = new ShaderMemory();
+        Span<byte> bytes = stackalloc byte[3 * sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, word);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes[sizeof(uint)..], 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes[(2 * sizeof(uint))..], 0xBF810000u);
+        Assert.True(memory.TryWrite(0x1000, bytes));
+        Assert.True(Gen5ShaderTranslator.TryDecodeProgram(new CpuContext(memory, Generation.Gen5), 0x1000,
+            out var program, out var error), error);
+        var append = Assert.Single(program.Instructions, instruction => instruction.Opcode == "DsAppend");
+        Assert.Equal(global, Assert.IsType<Gen5DataShareControl>(append.Control).Gds);
+    }
+
     public const uint LowerWord = 0x12345678;
     public const uint UpperWord = 0x90ABCDEF;
     public const uint UnchangedUpperWord = 0xCAFEBABE;
@@ -52,7 +69,7 @@ public sealed class Gen5DataShareRead64Tests
     public static Gen5ShaderProgram CreatePairedReadbackProgram(bool global, uint firstOffset, uint secondOffset, bool readEnabled)
     {
         var memory = new ShaderMemory();
-        uint[] words = [0xD9DC0000u | (global ? 1u << 16 : 0) | firstOffset | (secondOffset << 8), 0x03000003, 0xBF810000];
+        uint[] words = [0xD9DC0000u | (global ? 1u << 17 : 0) | firstOffset | (secondOffset << 8), 0x03000003, 0xBF810000];
         var bytes = new byte[words.Length * sizeof(uint)];
         for (var index = 0; index < words.Length; index++)
             BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(index * sizeof(uint)), words[index]);
@@ -100,7 +117,7 @@ public sealed class Gen5DataShareRead64Tests
     {
         const ulong shaderAddress = 0x1000;
         var memory = new ShaderMemory();
-        uint[] words = [0xD9D80000u | (global ? 1u << 16 : 0) | offset, 0x03000003u, 0xBF810000u];
+        uint[] words = [0xD9D80000u | (global ? 1u << 17 : 0) | offset, 0x03000003u, 0xBF810000u];
         var bytes = new byte[words.Length * sizeof(uint)];
         for (var index = 0; index < words.Length; index++)
             BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(index * sizeof(uint)), words[index]);

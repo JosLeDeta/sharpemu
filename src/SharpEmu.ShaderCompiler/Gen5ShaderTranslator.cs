@@ -2181,7 +2181,7 @@ public static partial class Gen5ShaderTranslator
                 control = new Gen5DataShareControl(
                     word & 0xFF,
                     (word >> 8) & 0xFF,
-                    ((word >> 16) & 1) != 0);
+                    ((word >> 17) & 1) != 0);
                 sources = opcode switch
                 {
                     "DsAppend" or "DsConsume" or "DsReadAddtidB32" => [Gen5Operand.Scalar(124)],
