@@ -276,7 +276,7 @@ public static class ResourceMaterializer
     {
         if (depth >= 6)
         {
-            return value.ToString();
+            return $"{value.Kind}#{value.Id}";
         }
 
         if (value.Kind == ScalarValueKind.ResourceTableWord)
@@ -328,7 +328,8 @@ public static class ResourceMaterializer
 
         if (value.Kind is ScalarValueKind.Phi or ScalarValueKind.Select or ScalarValueKind.Operation)
         {
-            return $"{value} operands=[{string.Join(", ", value.Operands.Select(operand =>
+            var name = value.Kind == ScalarValueKind.Operation ? value.Operation.ToString() : value.Kind.ToString();
+            return $"{name}#{value.Id} operands=[{string.Join(", ", value.Operands.Select(operand =>
                 DescribeEvaluationValue(plan, inputs, evaluator, operand, depth + 1)))}]";
         }
 
