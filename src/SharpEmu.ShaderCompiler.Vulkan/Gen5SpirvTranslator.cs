@@ -6335,8 +6335,19 @@ public static partial class Gen5SpirvTranslator
                     mask,
                     CurrentLaneBit()));
 
-        private void StoreWaveMask(uint register, uint condition) =>
-            StoreS64(register, BooleanToWaveMask(condition));
+        private void StoreWaveMask(uint register, uint condition)
+        {
+            var mask = BooleanToWaveMask(condition);
+            if (_waveLaneCount == 32)
+            {
+                // A wave32 comparison writes one SGPR; the next may hold a saved mask.
+                StoreS(register, _module.AddInstruction(SpirvOp.UConvert, _uintType, mask));
+            }
+            else
+            {
+                StoreS64(register, mask);
+            }
+        }
 
         private void EmitExecConditional(Action emit)
         {
