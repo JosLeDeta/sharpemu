@@ -1164,7 +1164,7 @@ public static partial class Gen5ShaderTranslator
     }
 
     private static bool IsVop3BOpcode(uint opcode) =>
-        opcode is 0x128 or 0x16D or 0x16E or 0x176 or 0x177 or 0x30F or 0x310 or 0x319;
+        opcode is 0x128 or 0x12A or 0x16D or 0x16E or 0x176 or 0x177 or 0x30F or 0x310 or 0x319;
 
     private static bool DecodeRaw2(
         uint word,
