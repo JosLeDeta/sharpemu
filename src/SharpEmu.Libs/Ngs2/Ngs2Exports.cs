@@ -26,9 +26,8 @@ public static partial class Ngs2Exports
     private static long _nextUid;
     private static long _renderCount;
 
-    // NGS2 renders one grain of interleaved float32 per sceNgs2SystemRender.
-    // The grain length defaults to 256 frames (matching the 8192-byte AudioOut
-    // buffers games copy it into) until the title overrides it.
+    // NGS2 advances one grain per system render; the device format is selected
+    // independently for each mastering output.
     private const int DefaultGrainSamples = 256;
     private const int DefaultSampleRate = 48000;
 
@@ -39,6 +38,14 @@ public static partial class Ngs2Exports
         public uint Uid { get; }
         public int GrainSamples { get; set; } = DefaultGrainSamples;
         public int SampleRate { get; set; } = DefaultSampleRate;
+        public Ngs2Mixer Mixer { get; } = new();
+        public ulong CallbackScratch;
+        public FileStream? Capture;
+        public int CaptureFrames;
+        public bool CaptureDone;
+        public bool Rendering;
+        public int LockOwner, LockDepth;
+        public byte[] CallbackPlane { get; } = new byte[8192 * 4];
     }
 
     private sealed record RackState(ulong SystemHandle, uint RackId);
@@ -53,8 +60,18 @@ public static partial class Ngs2Exports
 
         public ulong RackHandle { get; }
         public uint VoiceIndex { get; }
+        public Ngs2Mixer.Node Node { get; set; } = null!;
+        public double TotalSamples { get; set; }
+        public float Pitch { get; set; } = 1;
+        public SortedDictionary<uint, Biquad> Filters { get; } = new();
+        public ulong ProcessCallback, CallbackData0, CallbackData1, CallbackData2;
+        public bool CallbackFailed;
+        public WaveformInfo Waveform;
+        public List<SampleBlock> Blocks { get; } = new();
+        public int BlockIndex;
+        public uint BlockRepeats;
 
-        // Software-mixer playback state. Pcm is the fully decoded mono waveform;
+        // Software-mixer playback state. Pcm is decoded, interleaved PCM;
         // Position is a fractional read cursor advanced at the source/output rate
         // ratio each output frame.
         public short[]? Pcm { get; set; }
@@ -62,22 +79,37 @@ public static partial class Ngs2Exports
         public int SourceRate { get; set; }
         public double Position { get; set; }
         public bool Playing { get; set; }
+        public bool Paused { get; set; }
         public int LoopStart { get; set; } = -1;
         public int LoopEnd { get; set; }
         public float Gain { get; set; } = 1f;
+
+        public int SourceChannels { get; set; } = 1;
+        public uint FormatSampleRate { get; set; }
+        public uint FormatType, FormatChannels, FormatConfig;
+        public bool PreparingSequence, WaitingForData, AwaitMoreBlocks;
+        public short[]? PendingPcm;
+        public int PendingChannels, PendingRate;
+        public WaveformInfo PendingWaveform;
+        public LibAtrac9.Atrac9Decoder? StreamingDecoder;
+        public byte[] CompressedTail = [];
+        public uint StreamingSkip;
+        public ulong ElapsedSamples(long now) => (ulong)Math.Max(0, TotalSamples);
     }
+    private const uint VoiceStateFlagInUse = 0x1;
+    private const uint VoiceStateFlagPlaying = 0x2;
+    private const uint VoiceStateFlagStopped = 0x8;
+    private static long _voiceStateTraces;
+    private static long _voiceParamTraces;
 
     [SysAbiExport(Nid = "AQkj7C0f3PY", ExportName = "sceNgs2SystemResetOption",
         Target = Generation.Gen5, LibraryName = "libSceNgs2")]
     public static int Ngs2SystemResetOption(CpuContext ctx)
     {
         var address = ctx[CpuRegister.Rdi];
-        if (address == 0)
-        {
-            return SetReturn(ctx, OrbisNgs2ErrorInvalidOutAddress);
-        }
-
-        // The PS5 option occupies 144 bytes; initialize the entire structure.
+        if (address == 0) return SetReturn(ctx, OrbisNgs2ErrorInvalidOutAddress);
+        // Native layout: size, name[64], scheduler[4], flags, grain limits,
+        // sample rate, channel limit and five reserved words (144 bytes).
         Span<byte> option = stackalloc byte[144];
         option.Clear();
         BinaryPrimitives.WriteUInt64LittleEndian(option, (ulong)option.Length);
@@ -139,11 +171,12 @@ public static partial class Ngs2Exports
         var handle = ctx[CpuRegister.Rdi];
         lock (StateGate)
         {
-            if (!Systems.Remove(handle))
+            if (!Systems.Remove(handle, out var removedSystem))
             {
                 return SetReturn(ctx, OrbisNgs2ErrorInvalidSystemHandle);
             }
 
+            removedSystem.Capture?.Dispose();
             var rackHandles = Racks
                 .Where(pair => pair.Value.SystemHandle == handle)
                 .Select(pair => pair.Key)
@@ -264,7 +297,15 @@ public static partial class Ngs2Exports
 
         lock (StateGate)
         {
-            Voices[handle] = new VoiceState(rackHandle, voiceIndex);
+            var voice = new VoiceState(rackHandle, voiceIndex);
+            var rack = Racks[rackHandle];
+            voice.Node = new Ngs2Mixer.Node(handle) { Master = rack.RackId == 0x3000, Output = voiceIndex };
+            voice.Node.Source = (buffer, frames, channels, rate) =>
+            {
+                if (voice.Playing && voice.Pcm is { Length: > 0 }) MixOneVoice(buffer, frames, channels, rate, voice);
+            };
+            Systems[rack.SystemHandle].Mixer.Add(voice.Node);
+            Voices[handle] = voice;
         }
 
         return SetReturn(ctx, 0);
@@ -287,79 +328,86 @@ public static partial class Ngs2Exports
             }
         }
 
-        if (ShouldTrace())
+        if (ShouldTrace() && (Interlocked.Increment(ref _voiceParamTraces) <= 128 ||
+            (Volatile.Read(ref _voiceParamTraces) & 4095) == 0))
         {
             TraceVoiceParamList(ctx, voiceHandle, paramList);
         }
 
-        HandleVoiceParams(ctx, voiceHandle, paramList);
-        return SetReturn(ctx, 0);
+        lock (StateGate) return SetReturn(ctx, HandleVoiceParams(ctx, voiceHandle, paramList));
     }
 
-    // Parse the SceNgs2VoiceParamHead command list (header = u32 size, u32 id;
-    // params are laid out contiguously) and apply the ones the mixer needs:
-    // the waveform-blocks param arms a voice with decoded PCM, and the port
-    // matrix param carries its output gain.
-    private static void HandleVoiceParams(CpuContext ctx, ulong voiceHandle, ulong paramList)
+    // Legacy parameter lists have a u16 size / i16 relative next / u32 id.
+    private static int HandleVoiceParams(CpuContext ctx, ulong voiceHandle, ulong paramList)
     {
-        if (paramList == 0)
-        {
-            return;
-        }
-
         var offset = paramList;
-        for (var guard = 0; guard < 32; guard++)
+        var result = 0;
+        for (var guard = 0; guard < 256 && offset != 0; guard++)
         {
-            if (!ctx.TryReadUInt32(offset, out var size) ||
-                !ctx.TryReadUInt32(offset + 4, out var id))
+            if (!ctx.TryReadUInt16(offset, out var size) || size < 8 || size > 4096 ||
+                !ctx.TryReadUInt16(offset + 2, out var next) ||
+                !ctx.TryReadUInt32(offset + 4, out var id)) return InvalidAudioArgument;
+            if (id == 0x10000000 && size >= 40) ApplySamplerSetupParam(ctx, voiceHandle, offset);
+            else if (id == 0x10000001 && size >= 32)
             {
-                return;
+                if (!ApplyWaveformParam(ctx, voiceHandle, offset))
+                    result = OrbisNgs2ErrorInvalidWaveformData;
             }
-
-            switch (id)
-            {
-                case 0x10000001:
-                    ApplyWaveformParam(ctx, voiceHandle, offset);
-                    break;
-                case 0x20010001:
-                    ApplyPortMatrixParam(ctx, voiceHandle, offset);
-                    break;
-            }
-
-            // Advance to the next contiguous block; the game normally sends one
-            // param per call (size==whole block), so stop when size is degenerate.
-            if (size < 8 || size > 0x1000)
-            {
-                return;
-            }
-
-            offset += (size + 7) & ~7u;
+            else if (!ApplyRoutingParam(ctx, voiceHandle, offset, size, id)) result = InvalidAudioArgument;
+            if (result != 0 && UnsupportedCommands.Add(((ulong)id << 32) | size))
+                Console.Error.WriteLine($"[LOADER][WARN] ngs2.parameter_rejected id=0x{id:X8} size={size} voice=0x{voiceHandle:X}");
+            if (next == 0) return result;
+            offset = unchecked((ulong)((long)offset + (short)next));
         }
+        return InvalidAudioArgument;
     }
 
-    // Waveform-blocks param: the guest pointer at +8 references a "VAGp"
-    // (PS-ADPCM) container. Decode it once and arm the voice for playback.
-    private static void ApplyWaveformParam(CpuContext ctx, ulong voiceHandle, ulong paramOffset)
+    // Sampler setup param: head (8) + SceNgs2WaveformFormat (32). Keeps the
+    // source format sample rate used by the decoder.
+    private static void ApplySamplerSetupParam(CpuContext ctx, ulong voiceHandle, ulong paramOffset)
     {
-        if (!ctx.TryReadUInt64(paramOffset + 8, out var dataAddr) || dataAddr <= 0x10000)
+        if (!ctx.TryReadUInt32(paramOffset + 8 + 0x08, out var sampleRate))
         {
             return;
         }
 
         lock (StateGate)
         {
-            if (Voices.TryGetValue(voiceHandle, out var existing) &&
-                existing.SourceAddr == dataAddr && existing.Pcm is not null)
+            if (Voices.TryGetValue(voiceHandle, out var voice))
             {
-                // Same waveform already armed — don't restart it every frame.
-                return;
+                voice.FormatSampleRate = sampleRate;
+                ctx.TryReadUInt32(paramOffset + 8, out voice.FormatType);
+                ctx.TryReadUInt32(paramOffset + 12, out voice.FormatChannels);
+                ctx.TryReadUInt32(paramOffset + 20, out voice.FormatConfig);
+                voice.StreamingDecoder = null; voice.CompressedTail = []; voice.StreamingSkip = 0;
             }
+        }
+    }
+
+    // Waveform-blocks param: head (8), const void* data (+8), uint32 flags
+    // (+16), uint32 numBlocks (+20), const SceNgs2WaveformBlock* (+24).
+    // VAG and supported RIFF codecs are decoded to actual sample frames.
+    // Loading data does not implicitly start a stopped voice.
+    private static bool ApplyWaveformParam(CpuContext ctx, ulong voiceHandle, ulong paramOffset)
+    {
+        if (!ctx.TryReadUInt64(paramOffset + 8, out var dataAddr) || dataAddr <= 0x10000)
+        {
+            return false;
         }
 
         Span<byte> header = stackalloc byte[Ngs2VagDecoder.VagHeaderSize];
-        if (!ctx.Memory.TryRead(dataAddr, header) || !Ngs2VagDecoder.IsVag(header))
+        if (!ctx.Memory.TryRead(dataAddr, header))
         {
-            return;
+            return false;
+        }
+
+        if (!Ngs2VagDecoder.IsVag(header))
+        {
+            if (header[..4].SequenceEqual("RIFF"u8))
+                return ArmDecodedRiff(ctx, voiceHandle, dataAddr) && ConfigureBlocks(ctx, voiceHandle, paramOffset);
+            lock (StateGate)
+                return Voices.TryGetValue(voiceHandle, out var rawVoice) && (rawVoice.FormatType == 13
+                    ? ApplyRawAtrac9(ctx, rawVoice, paramOffset, dataAddr) : ApplyRawPcm(ctx, rawVoice, paramOffset, dataAddr));
         }
 
         var declaredSize = (int)BinaryPrimitives.ReadUInt32BigEndian(header[0x0C..]);
@@ -370,23 +418,21 @@ public static partial class Ngs2Exports
             if (!ctx.Memory.TryRead(dataAddr, raw.AsSpan(0, totalBytes)) ||
                 !Ngs2VagDecoder.TryDecode(raw.AsSpan(0, totalBytes), out var waveform))
             {
-                return;
+                return false;
             }
 
             lock (StateGate)
             {
                 if (!Voices.TryGetValue(voiceHandle, out var voice))
                 {
-                    return;
+                    return false;
                 }
 
-                voice.Pcm = waveform.Samples;
+                voice.PendingPcm = waveform.Samples;
+                voice.PendingWaveform = ParseVagWaveform(ctx, dataAddr, (ulong)totalBytes, header);
                 voice.SourceAddr = dataAddr;
-                voice.SourceRate = waveform.SampleRate;
-                voice.LoopStart = waveform.LoopStart;
-                voice.LoopEnd = waveform.LoopEnd > 0 ? waveform.LoopEnd : waveform.Samples.Length;
-                voice.Position = 0;
-                voice.Playing = true;
+                voice.PendingRate = waveform.SampleRate;
+                voice.PendingChannels = 1;
             }
 
             if (ShouldTrace())
@@ -405,30 +451,7 @@ public static partial class Ngs2Exports
         {
             System.Buffers.ArrayPool<byte>.Shared.Return(raw);
         }
-    }
-
-    // Port matrix param: the first float level is a reasonable proxy for the
-    // voice's output gain until per-channel panning is implemented.
-    private static void ApplyPortMatrixParam(CpuContext ctx, ulong voiceHandle, ulong paramOffset)
-    {
-        if (!ctx.TryReadUInt32(paramOffset + 12, out var levelBits))
-        {
-            return;
-        }
-
-        var level = BitConverter.UInt32BitsToSingle(levelBits);
-        if (!float.IsFinite(level) || level < 0f || level > 8f)
-        {
-            return;
-        }
-
-        lock (StateGate)
-        {
-            if (Voices.TryGetValue(voiceHandle, out var voice))
-            {
-                voice.Gain = level;
-            }
-        }
+        return ConfigureBlocks(ctx, voiceHandle, paramOffset);
     }
 
     // Empirically dump the SceNgs2VoiceParamHead-chained command list so we can
@@ -455,10 +478,13 @@ public static partial class Ngs2Exports
             }
 
             peek.Clear();
-            var readable = Math.Min((int)Math.Max((ushort)8, size), peek.Length);
+            // Always dump the full 32-byte window: the size word alone does
+            // not tell the layout apart (u32 size/id vs u16 size/next).
+            var readable = peek.Length;
             ctx.Memory.TryRead(offset, peek[..readable]);
             Console.Error.WriteLine(
-                $"[LOADER][TRACE] ngs2.voiceparam voice=0x{voiceHandle:X16} id=0x{id:X} size={size} next={unchecked((short)next)} bytes={Convert.ToHexString(peek[..readable])}");
+                $"[LOADER][TRACE] ngs2.voiceparam voice=0x{voiceHandle:X16} id=0x{id:X} size={size} next={unchecked((short)next)} " +
+                $"rdx=0x{ctx[CpuRegister.Rdx]:X} rcx=0x{ctx[CpuRegister.Rcx]:X} bytes={Convert.ToHexString(peek[..readable])}");
 
             // For the waveform-blocks param, follow the embedded pointers and
             // dump the pointed-to bytes so we can tell PCM16 from ATRAC9.
@@ -493,7 +519,7 @@ public static partial class Ngs2Exports
         ExportName = "sceNgs2VoiceRunCommands",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceNgs2")]
-    public static int Ngs2VoiceRunCommands(CpuContext ctx) => Ngs2VoiceControl(ctx);
+    public static int Ngs2VoiceRunCommands(CpuContext ctx) => RunVoiceCommands(ctx);
 
     [SysAbiExport(
         Nid = "i0VnXM-C9fc",
@@ -518,6 +544,14 @@ public static partial class Ngs2Exports
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
+        lock (StateGate)
+        {
+            var system = Systems[systemHandle];
+            if (system.Rendering) return SetReturn(ctx, InvalidAudioArgument);
+            system.Rendering = true;
+            try { system.Mixer.Render(system.GrainSamples, system.SampleRate, (node, frames, rate) => ProcessVoiceDsp(ctx, node, frames, rate)); }
+            finally { system.Rendering = false; }
+        }
         Span<byte> renderBufferInfo = stackalloc byte[RenderBufferInfoSize];
         for (uint i = 0; i < bufferInfoCount; i++)
         {
@@ -546,7 +580,10 @@ public static partial class Ngs2Exports
                     channels = (int)declaredChannels;
                 }
 
-                MixVoicesIntoGrain(ctx, systemHandle, bufferAddress, bufferSize, channels);
+                ctx.TryReadUInt32(entryAddress + 16, out var outputType);
+                if (outputType is not (2 or 8 or 18 or 28))
+                    return SetReturn(ctx, OrbisNgs2ErrorInvalidWaveformData);
+                MixVoicesIntoGrain(ctx, systemHandle, bufferAddress, bufferSize, channels, outputType is 2 or 18, i);
 
                 if (ShouldTrace() && Interlocked.Increment(ref _renderInfoDumps) <= 4)
                 {
@@ -567,71 +604,28 @@ public static partial class Ngs2Exports
         return SetReturn(ctx, 0);
     }
 
-    // Sum every armed voice belonging to this system into the leading grain of
-    // the render buffer as interleaved float32. The buffer was just zeroed, so
-    // this is a plain additive mix; silence stays silence when nothing plays.
     private static void MixVoicesIntoGrain(
-        CpuContext ctx, ulong systemHandle, ulong bufferAddress, ulong bufferSize, int channels)
+        CpuContext ctx, ulong systemHandle, ulong bufferAddress, ulong bufferSize, int channels, bool int16, uint output)
     {
-        int grain;
-        int sampleRate;
         lock (StateGate)
         {
-            if (!Systems.TryGetValue(systemHandle, out var system))
+            if (!Systems.TryGetValue(systemHandle, out var system)) return;
+            var frames = (int)Math.Min((ulong)system.GrainSamples, bufferSize / (ulong)(channels * (int16 ? 2 : 4)));
+            if (frames == 0) return;
+            var count = frames * channels;
+            var accum = ArrayPool<float>.Shared.Rent(count);
+            try
             {
-                return;
+                system.Mixer.ReadOutput(output, accum.AsSpan(0, count), channels);
+                if (output == 0) DiagnoseOutput(system, accum.AsSpan(0, count), channels);
+                WriteGrain(ctx, bufferAddress, accum, count, int16);
             }
-
-            grain = system.GrainSamples;
-            sampleRate = system.SampleRate;
-        }
-
-        var capacityFrames = (int)Math.Min((ulong)grain, bufferSize / (ulong)(channels * sizeof(float)));
-        if (capacityFrames <= 0)
-        {
-            return;
-        }
-
-        var floatCount = capacityFrames * channels;
-        var accum = ArrayPool<float>.Shared.Rent(floatCount);
-        var mixedAnything = false;
-        try
-        {
-            Array.Clear(accum, 0, floatCount);
-            lock (StateGate)
-            {
-                foreach (var pair in Voices)
-                {
-                    var voice = pair.Value;
-                    if (!voice.Playing || voice.Pcm is null || voice.Pcm.Length == 0)
-                    {
-                        continue;
-                    }
-
-                    if (!Racks.TryGetValue(voice.RackHandle, out var rack) ||
-                        rack.SystemHandle != systemHandle)
-                    {
-                        continue;
-                    }
-
-                    MixOneVoice(accum, capacityFrames, channels, sampleRate, voice);
-                    mixedAnything = true;
-                }
-            }
-
-            if (mixedAnything)
-            {
-                WriteGrain(ctx, bufferAddress, accum, floatCount);
-            }
-        }
-        finally
-        {
-            ArrayPool<float>.Shared.Return(accum);
+            finally { ArrayPool<float>.Shared.Return(accum); }
         }
     }
 
-    // Resample one voice to the system rate and add
-    // it to the front stereo pair. Advances the voice cursor and handles loop /
+    // Resample one voice into its native channels. Routing follows separately.
+    // Advances the voice cursor and handles loop /
     // one-shot end. Must be called under StateGate.
     private static void MixOneVoice(
         float[] accum,
@@ -640,66 +634,49 @@ public static partial class Ngs2Exports
         int outputSampleRate,
         VoiceState voice)
     {
-        var pcm = voice.Pcm!;
-        var loopEnd = voice.LoopEnd > 0 && voice.LoopEnd <= pcm.Length ? voice.LoopEnd : pcm.Length;
-        var loopStart = voice.LoopStart;
-        var step = voice.SourceRate / (double)outputSampleRate;
-        var gain = voice.Gain / 32768f;
-        var pos = voice.Position;
         for (var f = 0; f < frames; f++)
         {
-            var idx = (int)pos;
-            if (idx >= loopEnd)
+            while (voice.Playing && !voice.WaitingForData && voice.Position >= voice.LoopEnd)
             {
-                if (loopStart >= 0 && loopStart < loopEnd)
+                var overshoot = voice.Position - voice.LoopEnd;
+                if (voice.BlockRepeats > 0)
                 {
-                    pos = loopStart;
-                    idx = loopStart;
+                    if (voice.BlockRepeats != uint.MaxValue) voice.BlockRepeats--;
+                    voice.Position = voice.LoopStart + overshoot;
                 }
-                else
-                {
-                    voice.Playing = false;
-                    break;
-                }
+                else StartBlock(voice, voice.BlockIndex + 1, overshoot);
             }
-
-            if (idx < 0 || idx >= pcm.Length)
-            {
-                voice.Playing = false;
-                break;
-            }
-
+            if (!voice.Playing || voice.WaitingForData || voice.Pcm is null || voice.LoopEnd <= voice.LoopStart) break;
+            var pcm = voice.Pcm;
+            var idx = (int)voice.Position;
+            if (idx < 0 || idx >= pcm.Length / voice.SourceChannels) { voice.Playing = false; break; }
             var next = idx + 1;
-            if (next >= loopEnd)
+            if (next >= voice.LoopEnd) next = voice.BlockRepeats > 0 ? voice.LoopStart : idx;
+            var fraction = voice.Position - idx;
+            for (var channel = 0; channel < Math.Min(channels, voice.SourceChannels); channel++)
             {
-                next = loopStart >= 0 && loopStart < loopEnd ? loopStart : idx;
+                var a = pcm[idx * voice.SourceChannels + channel];
+                var b = pcm[next * voice.SourceChannels + channel];
+                accum[f * channels + channel] += (float)((a + (b - a) * fraction) * (voice.Gain / 32768f));
             }
-
-            var fraction = pos - idx;
-            var sample = (float)((pcm[idx] + ((pcm[next] - pcm[idx]) * fraction)) * gain);
-            var baseIndex = f * channels;
-            accum[baseIndex] += sample;
-            if (channels > 1)
-            {
-                accum[baseIndex + 1] += sample;
-            }
-
-            pos += step;
+            var step = voice.SourceRate * (double)voice.Pitch / outputSampleRate;
+            voice.Position += step;
+            voice.TotalSamples += step;
         }
-
-        voice.Position = pos;
     }
 
-    private static void WriteGrain(CpuContext ctx, ulong address, float[] accum, int count)
+    private static void WriteGrain(CpuContext ctx, ulong address, float[] accum, int count, bool int16)
     {
-        var bytes = ArrayPool<byte>.Shared.Rent(count * sizeof(float));
+        var width = int16 ? 2 : 4;
+        var bytes = ArrayPool<byte>.Shared.Rent(count * width);
         try
         {
-            var span = bytes.AsSpan(0, count * sizeof(float));
+            var span = bytes.AsSpan(0, count * width);
             for (var i = 0; i < count; i++)
             {
-                var value = Math.Clamp(accum[i], -1f, 1f);
-                BinaryPrimitives.WriteSingleLittleEndian(span.Slice(i * sizeof(float), sizeof(float)), value);
+                var value = float.IsFinite(accum[i]) ? Math.Clamp(accum[i], -1f, 1f) : 0f;
+                if (int16) BinaryPrimitives.WriteInt16LittleEndian(span[(i * 2)..], (short)Math.Clamp(value * 32768f, short.MinValue, short.MaxValue));
+                else BinaryPrimitives.WriteSingleLittleEndian(span[(i * 4)..], value);
             }
 
             ctx.Memory.TryWrite(address, span);
@@ -758,10 +735,8 @@ public static partial class Ngs2Exports
                 return SetReturn(ctx, OrbisNgs2ErrorInvalidSystemHandle);
             }
 
-            if (grain > 0 && grain <= 8192)
-            {
-                system.GrainSamples = grain;
-            }
+            if (grain is <= 0 or > 8192) return SetReturn(ctx, InvalidAudioArgument);
+            system.GrainSamples = grain;
         }
 
         return SetReturn(ctx, 0);
@@ -799,14 +774,35 @@ public static partial class Ngs2Exports
         ExportName = "sceNgs2SystemLock",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceNgs2")]
-    public static int Ngs2SystemLock(CpuContext ctx) => ValidateSystem(ctx);
+    public static int Ngs2SystemLock(CpuContext ctx)
+    {
+        Monitor.Enter(StateGate);
+        if (!Systems.TryGetValue(ctx[CpuRegister.Rdi], out var system))
+        {
+            Monitor.Exit(StateGate);
+            return SetReturn(ctx, OrbisNgs2ErrorInvalidSystemHandle);
+        }
+        system.LockOwner = Environment.CurrentManagedThreadId;
+        system.LockDepth++;
+        return SetReturn(ctx, 0);
+    }
 
     [SysAbiExport(
         Nid = "JXRC5n0RQls",
         ExportName = "sceNgs2SystemUnlock",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceNgs2")]
-    public static int Ngs2SystemUnlock(CpuContext ctx) => ValidateSystem(ctx);
+    public static int Ngs2SystemUnlock(CpuContext ctx)
+    {
+        if (!Monitor.IsEntered(StateGate)) return SetReturn(ctx, InvalidAudioArgument);
+        if (!Systems.TryGetValue(ctx[CpuRegister.Rdi], out var system))
+            return SetReturn(ctx, OrbisNgs2ErrorInvalidSystemHandle);
+        if (system.LockDepth == 0 || system.LockOwner != Environment.CurrentManagedThreadId)
+            return SetReturn(ctx, InvalidAudioArgument);
+        if (--system.LockDepth == 0) system.LockOwner = 0;
+        Monitor.Exit(StateGate);
+        return SetReturn(ctx, 0);
+    }
 
     [SysAbiExport(
         Nid = "-TOuuAQ-buE",
@@ -818,24 +814,65 @@ public static partial class Ngs2Exports
         var voiceHandle = ctx[CpuRegister.Rdi];
         var stateAddress = ctx[CpuRegister.Rsi];
         var stateSize = (int)Math.Min(ctx[CpuRegister.Rdx], 0x400);
+        uint flags;
+        ulong decodedSamples, decodedBytes, waveformAddress;
         lock (StateGate)
         {
-            if (!Voices.ContainsKey(voiceHandle))
+            if (!Voices.TryGetValue(voiceHandle, out var voice))
             {
                 return SetReturn(ctx, OrbisNgs2ErrorInvalidVoiceHandle);
             }
+
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            flags = ComputeVoiceStateFlags(voice, now);
+            decodedSamples = voice.ElapsedSamples(now);
+            decodedBytes = voice.Waveform.NumFrameSamples == 0 ? 0 :
+                decodedSamples / voice.Waveform.NumFrameSamples * voice.Waveform.FrameSize;
+            waveformAddress = voice.SourceAddr;
         }
 
-        // Report an idle (not-in-use) voice: all-zero state block.
+        if (ShouldTrace() && Interlocked.Increment(ref _voiceStateTraces) <= 64)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] ngs2.voice_state voice=0x{voiceHandle:X16} size={stateSize} flags=0x{flags:X} decoded={decodedSamples}");
+        }
+
+        // SceNgs2SamplerVoiceState: stateFlags (+0), envelope/peak floats,
+        // numDecodedSamples (+16), decodedDataSize (+24), userData (+32).
         if (stateAddress != 0 && stateSize > 0)
         {
-            if (!TryClearGuestBuffer(ctx, stateAddress, (ulong)stateSize))
+            if (!TryClearGuestBuffer(ctx, stateAddress, (ulong)stateSize) ||
+                !ctx.TryWriteUInt32(stateAddress, flags))
             {
                 return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
+
+            // RDR requests 56 bytes and reads playback position at +24.
+            var samplesOffset = ctx.TargetGeneration == Generation.Gen5 ? 24UL : 16UL;
+            if ((ulong)stateSize >= samplesOffset + 8) ctx.TryWriteUInt64(stateAddress + samplesOffset, decodedSamples);
+            if ((ulong)stateSize >= samplesOffset + 16) ctx.TryWriteUInt64(stateAddress + samplesOffset + 8, decodedBytes);
+            if ((ulong)stateSize >= samplesOffset + 32) ctx.TryWriteUInt64(stateAddress + samplesOffset + 24, waveformAddress);
         }
 
         return SetReturn(ctx, 0);
+    }
+
+    private static uint ComputeVoiceStateFlags(VoiceState voice, long now)
+    {
+        // Flags follow playback driven by rendered frames, never wall-clock time.
+        if (voice.Paused) return VoiceStateFlagInUse | 4;
+        if (voice.Playing && voice.Pcm is not null)
+        {
+            return VoiceStateFlagInUse | VoiceStateFlagPlaying;
+        }
+
+        if (voice.Pcm is not null)
+        {
+            return VoiceStateFlagInUse | VoiceStateFlagStopped;
+        }
+
+        // Never armed: idle, all flags clear.
+        return 0;
     }
 
     [SysAbiExport(
@@ -847,16 +884,19 @@ public static partial class Ngs2Exports
     {
         var voiceHandle = ctx[CpuRegister.Rdi];
         var flagsAddress = ctx[CpuRegister.Rsi];
+        uint flags;
         lock (StateGate)
         {
-            if (!Voices.ContainsKey(voiceHandle))
+            if (!Voices.TryGetValue(voiceHandle, out var voice))
             {
                 return SetReturn(ctx, OrbisNgs2ErrorInvalidVoiceHandle);
             }
+
+            flags = ComputeVoiceStateFlags(voice, System.Diagnostics.Stopwatch.GetTimestamp());
         }
 
         // The output is uint32_t; a wider store overwrites adjacent guest data.
-        if (flagsAddress != 0 && !ctx.TryWriteUInt32(flagsAddress, 0))
+        if (flagsAddress != 0 && !ctx.TryWriteUInt32(flagsAddress, flags))
         {
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
@@ -911,13 +951,15 @@ public static partial class Ngs2Exports
 
     private static void RemoveRackLocked(ulong rackHandle)
     {
-        Racks.Remove(rackHandle);
+        Racks.Remove(rackHandle, out var removedRack);
         foreach (var voiceHandle in Voices
                      .Where(pair => pair.Value.RackHandle == rackHandle)
                      .Select(pair => pair.Key)
                      .ToArray())
         {
             Voices.Remove(voiceHandle);
+            if (removedRack is not null && Systems.TryGetValue(removedRack.SystemHandle, out var system))
+                system.Mixer.Remove(voiceHandle);
         }
     }
 
@@ -937,26 +979,408 @@ public static partial class Ngs2Exports
         ExportName = "sceNgs2PanInit",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceNgs2")]
-    public static int Ngs2PanInit(CpuContext ctx) => ctx.SetReturn(0);
+    public static int Ngs2PanInit(CpuContext ctx) => InitializePan(ctx);
 
     [SysAbiExport(
         Nid = "1WsleK-MTkE",
         ExportName = "sceNgs2GeomCalcListener",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceNgs2")]
-    public static int Ngs2GeomCalcListener(CpuContext ctx) => ctx.SetReturn(0);
+    public static int Ngs2GeomCalcListener(CpuContext ctx) => CalculateListener(ctx);
 
     [SysAbiExport(
         Nid = "0lbbayqDNoE",
         ExportName = "sceNgs2GeomResetSourceParam",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceNgs2")]
-    public static int Ngs2GeomResetSourceParam(CpuContext ctx) => ctx.SetReturn(0);
+    public static int Ngs2GeomResetSourceParam(CpuContext ctx) => ResetSource(ctx);
 
     [SysAbiExport(
         Nid = "7Lcfo8SmpsU",
         ExportName = "sceNgs2GeomResetListenerParam",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceNgs2")]
-    public static int Ngs2GeomResetListenerParam(CpuContext ctx) => ctx.SetReturn(0);
+    public static int Ngs2GeomResetListenerParam(CpuContext ctx) => ResetListener(ctx);
+
+    // SceNgs2WaveformInfo (0xD0 bytes): format (0x20) followed by the
+    // data/loop/unit fields and up to four SceNgs2WaveformBlock (0x20 each).
+    private const int WaveformInfoSize = 0xE8;
+    private const int WaveformInfoMaxBlocks = 4;
+    private const uint WaveformTypePcmI16Little = 2;
+    private const uint WaveformTypePcmF32Little = 8;
+    private const uint WaveformTypeVag = 12;
+    private const uint WaveformTypeAtrac9 = 13;
+    private const int OrbisNgs2ErrorInvalidWaveformData = unchecked((int)0x804A0100);
+    private const int OrbisNgs2ErrorInvalidBufferAddress = unchecked((int)0x804A0050);
+    private static long _unknownWaveformDumps;
+
+    private readonly record struct WaveformInfo(
+        uint Type,
+        uint Channels,
+        uint SampleRate,
+        uint ConfigData,
+        uint FrameSize,
+        uint NumFrameSamples,
+        uint DataOffset,
+        uint DataSize,
+        uint LoopBegin,
+        uint LoopEnd,
+        uint NumSamples, uint DelaySamples = 0);
+
+    // Leaving this import unresolved crashed RDR in-game: the title used the
+    // untouched output struct (garbage waveform type/offsets) and dereferenced
+    // a null pointer a few instructions later.
+    [SysAbiExport(
+        Nid = "hyVLT2VlOYk",
+        ExportName = "sceNgs2ParseWaveformData",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNgs2")]
+    public static int Ngs2ParseWaveformData(CpuContext ctx)
+    {
+        var dataAddress = ctx[CpuRegister.Rdi];
+        var dataSize = ctx[CpuRegister.Rsi];
+        var outInfoAddress = ctx[CpuRegister.Rdx];
+        if (outInfoAddress == 0)
+        {
+            return SetReturn(ctx, OrbisNgs2ErrorInvalidOutAddress);
+        }
+
+        if (dataAddress == 0 || dataSize < 16)
+        {
+            return SetReturn(ctx, OrbisNgs2ErrorInvalidBufferAddress);
+        }
+
+        // Only the headers are needed; cap what is read from guest memory.
+        var headerLength = (int)Math.Min(dataSize, 4096);
+        var header = ArrayPool<byte>.Shared.Rent(headerLength);
+        try
+        {
+            var head = header.AsSpan(0, headerLength);
+            if (!ctx.Memory.TryRead(dataAddress, head))
+            {
+                return SetReturn(ctx, OrbisNgs2ErrorInvalidBufferAddress);
+            }
+
+            WaveformInfo info;
+            if (Ngs2VagDecoder.IsVag(head))
+            {
+                info = ParseVagWaveform(ctx, dataAddress, dataSize, head);
+            }
+            else if (!TryParseRiffWaveform(head, dataSize, out info))
+            {
+                if (Interlocked.Increment(ref _unknownWaveformDumps) <= 8)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] ngs2.parse_waveform unknown container addr=0x{dataAddress:X} " +
+                        $"size={dataSize} head={Convert.ToHexString(head[..Math.Min(32, head.Length)])}");
+                }
+
+                return SetReturn(ctx, OrbisNgs2ErrorInvalidWaveformData);
+            }
+
+            return SetReturn(ctx, WriteWaveformInfo(ctx, outInfoAddress, info) ? 0 : OrbisNgs2ErrorInvalidOutAddress);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(header);
+        }
+    }
+
+    // "VAGp": 48-byte big-endian header, 16-byte PS-ADPCM frames of 28
+    // samples; loop points come from the per-frame flag byte.
+    private static WaveformInfo ParseVagWaveform(CpuContext ctx, ulong dataAddress, ulong dataSize, ReadOnlySpan<byte> head)
+    {
+        var declaredSize = BinaryPrimitives.ReadUInt32BigEndian(head[0x0C..]);
+        var sampleRate = BinaryPrimitives.ReadUInt32BigEndian(head[0x10..]);
+        var channels = head.Length > 0x1E && head[0x1E] is > 0 and <= 8 ? (uint)head[0x1E] : 1u;
+        var available = dataSize > Ngs2VagDecoder.VagHeaderSize
+            ? dataSize - Ngs2VagDecoder.VagHeaderSize
+            : 0;
+        var adpcmSize = (uint)Math.Min(declaredSize == 0 ? available : Math.Min(declaredSize, available), int.MaxValue);
+        adpcmSize -= adpcmSize % 16;
+        var frameCount = adpcmSize / 16;
+        var numSamples = frameCount * 28;
+
+        var loopBegin = 0u;
+        var loopEnd = 0u;
+        var frames = ArrayPool<byte>.Shared.Rent((int)Math.Min(adpcmSize, 8 * 1024 * 1024));
+        try
+        {
+            var scan = frames.AsSpan(0, (int)Math.Min(adpcmSize, 8 * 1024 * 1024));
+            if (ctx.Memory.TryRead(dataAddress + Ngs2VagDecoder.VagHeaderSize, scan))
+            {
+                for (var frame = 0; frame * 16 + 16 <= scan.Length; frame++)
+                {
+                    var flags = scan[frame * 16 + 1];
+                    if ((flags & 0x4) != 0 && loopEnd == 0)
+                    {
+                        loopBegin = (uint)frame * 28;
+                    }
+
+                    if ((flags & 0x3) == 0x3)
+                    {
+                        loopEnd = (uint)(frame + 1) * 28;
+                        break;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(frames);
+        }
+
+        return new WaveformInfo(
+            WaveformTypeVag,
+            channels,
+            sampleRate == 0 ? 48000u : sampleRate,
+            0,
+            16,
+            28,
+            Ngs2VagDecoder.VagHeaderSize,
+            adpcmSize,
+            loopBegin,
+            loopEnd,
+            numSamples);
+    }
+
+    // RIFF/WAVE: PCM16, float32 and ATRAC9 (WAVE_FORMAT_EXTENSIBLE whose
+    // sub-format starts with 0x42D2) containers; loop points from "smpl".
+    private static bool TryParseRiffWaveform(ReadOnlySpan<byte> head, ulong dataSize, out WaveformInfo info)
+    {
+        info = default;
+        if (head.Length < 12 ||
+            BinaryPrimitives.ReadUInt32BigEndian(head) != 0x52494646u || // "RIFF"
+            BinaryPrimitives.ReadUInt32BigEndian(head[8..]) != 0x57415645u) // "WAVE"
+        {
+            return false;
+        }
+
+        ushort formatTag = 0;
+        uint channels = 0;
+        uint sampleRate = 0;
+        uint blockAlign = 0;
+        uint bitsPerSample = 0;
+        uint configData = 0;
+        uint factSamples = 0;
+        uint delaySamples = 0;
+        uint dataOffset = 0;
+        uint chunkDataSize = 0;
+        uint loopBegin = 0;
+        uint loopEnd = 0;
+        var offset = 12;
+        while (offset + 8 <= head.Length)
+        {
+            var chunkId = BinaryPrimitives.ReadUInt32BigEndian(head[offset..]);
+            var chunkSize = BinaryPrimitives.ReadUInt32LittleEndian(head[(offset + 4)..]);
+            var body = offset + 8;
+            var bodyAvailable = Math.Min((int)Math.Min(chunkSize, int.MaxValue), head.Length - body);
+            switch (chunkId)
+            {
+                case 0x666D7420: // "fmt "
+                    if (bodyAvailable < 16)
+                    {
+                        return false;
+                    }
+
+                    formatTag = BinaryPrimitives.ReadUInt16LittleEndian(head[body..]);
+                    channels = BinaryPrimitives.ReadUInt16LittleEndian(head[(body + 2)..]);
+                    sampleRate = BinaryPrimitives.ReadUInt32LittleEndian(head[(body + 4)..]);
+                    blockAlign = BinaryPrimitives.ReadUInt16LittleEndian(head[(body + 12)..]);
+                    bitsPerSample = BinaryPrimitives.ReadUInt16LittleEndian(head[(body + 14)..]);
+                    if (formatTag == 0xFFFE && bodyAvailable >= 26)
+                    {
+                        formatTag = BinaryPrimitives.ReadUInt16LittleEndian(head[(body + 24)..]);
+                        if (formatTag == 0x42D2 && bodyAvailable >= 48)
+                        {
+                            configData = BinaryPrimitives.ReadUInt32LittleEndian(head[(body + 44)..]);
+                        }
+                    }
+
+                    break;
+                case 0x66616374: // "fact"
+                    if (bodyAvailable >= 4)
+                    {
+                        factSamples = BinaryPrimitives.ReadUInt32LittleEndian(head[body..]);
+                        if (bodyAvailable >= 12) delaySamples = BinaryPrimitives.ReadUInt32LittleEndian(head[(body + 8)..]);
+                    }
+
+                    break;
+                case 0x736D706C: // "smpl"
+                    if (bodyAvailable >= 0x34 &&
+                        BinaryPrimitives.ReadUInt32LittleEndian(head[(body + 0x1C)..]) > 0)
+                    {
+                        loopBegin = BinaryPrimitives.ReadUInt32LittleEndian(head[(body + 0x2C)..]);
+                        loopEnd = BinaryPrimitives.ReadUInt32LittleEndian(head[(body + 0x30)..]) + 1;
+                    }
+
+                    break;
+                case 0x64617461: // "data"
+                    dataOffset = (uint)body;
+                    chunkDataSize = chunkSize;
+                    break;
+            }
+
+            if (dataOffset != 0)
+            {
+                break;
+            }
+
+            offset = body + (int)Math.Min(chunkSize + (chunkSize & 1), int.MaxValue - body);
+        }
+
+        if (dataOffset == 0 || channels == 0 || sampleRate == 0 || blockAlign == 0)
+        {
+            return false;
+        }
+
+        var available = dataSize > dataOffset ? dataSize - dataOffset : 0;
+        var effectiveDataSize = (uint)Math.Min(Math.Min(chunkDataSize, available), int.MaxValue);
+        uint type;
+        uint frameSize;
+        uint numFrameSamples;
+        uint numSamples;
+        switch (formatTag)
+        {
+            case 0x0001 when bitsPerSample == 16:
+                type = WaveformTypePcmI16Little;
+                frameSize = blockAlign;
+                numFrameSamples = 1;
+                numSamples = effectiveDataSize / blockAlign;
+                break;
+            case 0x0003 when bitsPerSample == 32:
+                type = WaveformTypePcmF32Little;
+                frameSize = blockAlign;
+                numFrameSamples = 1;
+                numSamples = effectiveDataSize / blockAlign;
+                break;
+            case 0x42D2:
+                type = WaveformTypeAtrac9;
+                frameSize = blockAlign;
+                try
+                {
+                    var config = BitConverter.GetBytes(configData);
+                    var codec = new LibAtrac9.Atrac9Config(config);
+                    frameSize = (uint)codec.SuperframeBytes;
+                    numFrameSamples = (uint)codec.SuperframeSamples;
+                    if (codec.ChannelCount != channels || codec.SampleRate != sampleRate || frameSize != blockAlign) return false;
+                }
+                catch (Exception ex) when (ex is ArgumentException or InvalidDataException or IndexOutOfRangeException) { return false; }
+                numSamples = factSamples != 0 ? factSamples : effectiveDataSize / frameSize * numFrameSamples;
+                if (loopEnd > 0)
+                {
+                    loopBegin = loopBegin >= delaySamples ? loopBegin - delaySamples : 0;
+                    loopEnd = loopEnd >= delaySamples ? loopEnd - delaySamples : 0;
+                }
+                break;
+            default:
+                return false;
+        }
+
+        info = new WaveformInfo(
+            type,
+            channels,
+            sampleRate,
+            configData,
+            frameSize,
+            numFrameSamples,
+            dataOffset,
+            effectiveDataSize,
+            loopBegin,
+            loopEnd,
+            numSamples, delaySamples);
+        return true;
+    }
+
+    private static bool WriteWaveformInfo(CpuContext ctx, ulong address, WaveformInfo info)
+    {
+        Span<byte> buffer = stackalloc byte[WaveformInfoSize];
+        buffer.Clear();
+        // PS5: 24-byte format + 48-byte info + four 40-byte blocks.
+        // Verified against RDR's 0xE8-byte copy and 64-bit block offset writes.
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer, info.Type);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[4..], info.Channels);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[8..], info.SampleRate);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[12..], info.ConfigData);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[20..], info.DelaySamples);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x18..], info.DataOffset);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x1C..], info.DataSize);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x20..], info.LoopBegin);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x24..], info.LoopEnd);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x28..], info.NumSamples);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x2C..], info.FrameSize);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x30..], info.NumFrameSamples);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x34..], 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x38..], info.FrameSize);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x3C..], info.NumFrameSamples);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x40..], info.DelaySamples);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x44..], 1);
+        if (ctx.TargetGeneration == Generation.Gen5)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(buffer[0x48..], info.DataOffset);
+            BinaryPrimitives.WriteUInt64LittleEndian(buffer[0x50..], info.DataSize);
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x5C..], info.DelaySamples);
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x60..], info.NumSamples);
+        }
+        else
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x48..], info.DataOffset);
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x4C..], info.DataSize);
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x54..], info.DelaySamples);
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer[0x58..], info.NumSamples);
+        }
+        if (ShouldTrace())
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] ngs2.parse_waveform type={info.Type} ch={info.Channels} rate={info.SampleRate} " +
+                $"data=+0x{info.DataOffset:X}/{info.DataSize} samples={info.NumSamples} loop={info.LoopBegin}..{info.LoopEnd}");
+        }
+
+        return ctx.Memory.TryWrite(address, buffer[..(ctx.TargetGeneration == Generation.Gen5 ? 0xE8 : 0xC8)]);
+    }
+
+    // sceNgs2CalcWaveformBlock(format, samplePosition, numSamples, outBlock):
+    // byte range of a whole-frame span of the waveform.
+    [SysAbiExport(
+        Nid = "3pCNbVM11UA",
+        ExportName = "sceNgs2CalcWaveformBlock",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNgs2")]
+    public static int Ngs2CalcWaveformBlock(CpuContext ctx)
+    {
+        var formatAddress = ctx[CpuRegister.Rdi];
+        var samplePosition = (uint)ctx[CpuRegister.Rsi];
+        var numSamples = (uint)ctx[CpuRegister.Rdx];
+        var outBlockAddress = ctx[CpuRegister.Rcx];
+        if (outBlockAddress == 0)
+        {
+            return SetReturn(ctx, OrbisNgs2ErrorInvalidOutAddress);
+        }
+
+        if (!ReadFormatUnit(ctx, formatAddress, out var frameSize, out var frameSamples, out var delay))
+            return SetReturn(ctx, OrbisNgs2ErrorInvalidWaveformData);
+        var sampleStart = (ulong)samplePosition + delay;
+        var firstFrame = sampleStart / frameSamples;
+        var lastFrame = (sampleStart + numSamples + frameSamples - 1) / frameSamples;
+        Span<byte> block = stackalloc byte[ctx.TargetGeneration == Generation.Gen5 ? 40 : 32];
+        block.Clear();
+        var offset = firstFrame * frameSize;
+        var length = (lastFrame - firstFrame) * frameSize;
+        var field = 8;
+        if (ctx.TargetGeneration == Generation.Gen5)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(block, offset);
+            BinaryPrimitives.WriteUInt64LittleEndian(block[8..], length);
+            field = 16;
+        }
+        else
+        {
+            if (offset > uint.MaxValue || length > uint.MaxValue) return SetReturn(ctx, InvalidAudioArgument);
+            BinaryPrimitives.WriteUInt32LittleEndian(block, (uint)offset);
+            BinaryPrimitives.WriteUInt32LittleEndian(block[4..], (uint)length);
+        }
+        BinaryPrimitives.WriteUInt32LittleEndian(block[(field + 4)..], (uint)(sampleStart % frameSamples));
+        BinaryPrimitives.WriteUInt32LittleEndian(block[(field + 8)..], numSamples);
+        return SetReturn(ctx, ctx.Memory.TryWrite(outBlockAddress, block) ? 0 : OrbisNgs2ErrorInvalidOutAddress);
+    }
 }
