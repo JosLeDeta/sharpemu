@@ -276,6 +276,16 @@ public static partial class Gen5SpirvTranslator
                         instruction,
                         Ext(32, _floatType, GetFloatSource(instruction, 0)));
                     break;
+                case "VRcpF16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        _module.AddInstruction(
+                            SpirvOp.FDiv,
+                            _floatType,
+                            Float(1),
+                            GetFloat16Source(instruction, 0)));
+                    break;
                 case "VRsqF16":
                     result = EmitFloat16Result(
                         instruction,

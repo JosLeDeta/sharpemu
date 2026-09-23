@@ -19,6 +19,7 @@ public sealed class Gen5Float16ArithmeticTests
     {
         var program = Decode(
         [
+            0x7E00A901, // v_rcp_f16 v0, v1
             0x7E00AD01, // v_rsq_f16 v0, v1
             0x64000501, // v_add_f16 v0, v1, v2
             0x66060B04, // v_sub_f16 v3, v4, v5
@@ -30,7 +31,7 @@ public sealed class Gen5Float16ArithmeticTests
         ]);
 
         Assert.Equal(
-            ["VRsqF16", "VAddF16", "VSubF16", "VSubrevF16", "VMulF16", "VMaxF16", "VMinF16", "SEndpgm"],
+            ["VRcpF16", "VRsqF16", "VAddF16", "VSubF16", "VSubrevF16", "VMulF16", "VMaxF16", "VMinF16", "SEndpgm"],
             program.Instructions.Select(instruction => instruction.Opcode));
 
         var request = ResourceTestProgram.Request(program, userDataCount: 0);
@@ -46,6 +47,7 @@ public sealed class Gen5Float16ArithmeticTests
         Assert.Contains((ushort)SpirvOp.FAdd, opcodes);
         Assert.Contains((ushort)SpirvOp.FSub, opcodes);
         Assert.Contains((ushort)SpirvOp.FMul, opcodes);
+        Assert.Contains((ushort)SpirvOp.FDiv, opcodes);
         Assert.True(opcodes.Count(opcode => opcode == (ushort)SpirvOp.ExtInst) >= 3);
         Assert.DoesNotContain((ushort)SpirvCapability.Float16, ReadCapabilities(shader.Spirv));
     }
