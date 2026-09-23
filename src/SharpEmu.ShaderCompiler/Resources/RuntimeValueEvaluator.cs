@@ -206,8 +206,14 @@ public sealed class RuntimeValueEvaluator
         var handle = value.Operands[0];
         if (handle.Operands.Length < 2 ||
             !EvaluateWide(handle.Operands[0], out var low) ||
-            !EvaluateWide(handle.Operands[1], out var high) ||
-            !Operand(value, 1, out var offset))
+            !EvaluateWide(handle.Operands[1], out var high))
+        {
+            // The scalar prepass treats an unbound pointer as a zero-filled
+            // load in permissive mode. Keep the clean reader strict.
+            return value.Kind == ScalarValueKind.ScalarAddressWord && _inputs.AllowUnmappedScalarLoads;
+        }
+
+        if (!Operand(value, 1, out var offset))
         {
             return false;
         }
@@ -249,9 +255,17 @@ public sealed class RuntimeValueEvaluator
             }
         }
 
-        if (_inputs.ReadMemory is null || !_inputs.ReadMemory(address, out var word))
+        if (_inputs.ReadMemory is null)
         {
             return false;
+        }
+
+        if (!_inputs.ReadMemory(address, out var word))
+        {
+            // The local scalar prepass keeps a draw alive when an ordinary
+            // S_LOAD pointer is unavailable, while its strict mode rejects it.
+            // Never apply this to the clean reader used for resource predicates.
+            return value.Kind == ScalarValueKind.ScalarAddressWord && _inputs.AllowUnmappedScalarLoads;
         }
 
         result = word;

@@ -42,6 +42,36 @@ public sealed class ScalarValueGraphTests
     }
 
     [Fact]
+    public void UnmappedScalarPointerUsesZeroOnlyForOrdinaryReads()
+    {
+        var plan = Extract(Program(
+            MoveScalar(0, 4, 0x1000), MoveScalar(4, 5, 0),
+            ScalarLoad(8, 4, destination: 8),
+            MoveScalar(12, 9, 0), MoveScalar(16, 10, 16), MoveScalar(20, 11, 0),
+            BufferLoad(24, 8), EndProgram(32)));
+        bool Unreadable(ulong _, out uint word) { word = 0; return false; }
+        var inputs = new ResourceRuntimeInputs
+        {
+            ReadMemory = Unreadable,
+            ReadCleanMemory = Unreadable,
+            AllowUnmappedScalarLoads = true,
+        };
+
+        Assert.True(RuntimeValueEvaluator.FlattenResourceTable(plan, inputs, out var table));
+        Assert.Equal([0u], table);
+        Assert.False(RuntimeValueEvaluator.FlattenResourceTable(plan, inputs.WithReader(inputs.ReadCleanMemory), out _));
+        Assert.False(RuntimeValueEvaluator.FlattenResourceTable(plan, new ResourceRuntimeInputs { ReadMemory = Unreadable }, out _));
+
+        var unknownAddress = ScalarValue.Handle(ScalarValueKind.AddressHandle,
+            [ScalarValue.Undefined(ScalarValueType.U32), ScalarValue.Undefined(ScalarValueType.U32)]);
+        var unboundLoad = ScalarValue.MemoryRead(ScalarValueKind.ScalarAddressWord,
+            unknownAddress, ScalarValue.ConstantOf(0u), plan.TableReads[0].Value.MemoryIndex);
+        Assert.True(new RuntimeValueEvaluator(plan, inputs).Evaluate(unboundLoad, out var zero));
+        Assert.Equal(0u, zero);
+        Assert.False(new RuntimeValueEvaluator(plan, inputs.WithReader(inputs.ReadCleanMemory)).Evaluate(unboundLoad, out _));
+    }
+
+    [Fact]
     public void RawScalarComponentAlignment()
     {
         var program = Program(

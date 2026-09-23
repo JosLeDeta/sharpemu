@@ -16,6 +16,9 @@ public sealed class ResourceRuntimeInputs
     public ulong ShaderBase { get; init; }
     public GuestWordReader? ReadMemory { get; init; }
     public GuestWordReader? ReadCleanMemory { get; init; }
+    // Ordinary guest reads may use the scalar prepass's zero fallback. Clean
+    // reads still fail so an in-flight GPU write cannot be mistaken for zero.
+    public bool AllowUnmappedScalarLoads { get; init; }
     public ComputeSelectorState? ComputeState { get; init; }
 
     public ResourceRuntimeInputs WithReader(GuestWordReader? reader) => new()
@@ -24,6 +27,7 @@ public sealed class ResourceRuntimeInputs
         ShaderBase = ShaderBase,
         ReadMemory = reader,
         ReadCleanMemory = ReadCleanMemory,
+        AllowUnmappedScalarLoads = false,
         ComputeState = ComputeState,
     };
 }
