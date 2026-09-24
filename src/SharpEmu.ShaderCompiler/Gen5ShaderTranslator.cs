@@ -738,6 +738,7 @@ public static partial class Gen5ShaderTranslator
             0x09 => "SCbranchExecnz",
             0x0A => "SBarrier",
             0x0C => "SWaitcnt",
+            0x0F => "SSetprio",
             0x10 => "SSendmsg",
             0x12 => "STrap",
             0x16 => "STtraceData",
@@ -1856,6 +1857,9 @@ public static partial class Gen5ShaderTranslator
         {
             case Gen5ShaderEncoding.Sopp when opcode == "STrap":
                 sources = [new Gen5Operand(Gen5OperandKind.LiteralConstant, word & 0xFF)];
+                break;
+            case Gen5ShaderEncoding.Sopp when opcode == "SSetprio":
+                sources = [new Gen5Operand(Gen5OperandKind.LiteralConstant, word & 3u)];
                 break;
             case Gen5ShaderEncoding.Sop1:
                 sources = [Gen5Operand.Source(word & 0xFF, literal)];

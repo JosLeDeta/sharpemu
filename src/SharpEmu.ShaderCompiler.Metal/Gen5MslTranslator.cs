@@ -907,6 +907,9 @@ public static partial class Gen5MslTranslator
                 // No shader trap handler is installed, so S_TRAP has no effect.
                 case "STrap":
                     return true;
+                // Metal has no per-wave scheduling priority; retain host scheduling.
+                case "SSetprio":
+                    return true;
                 case "SNop":
                 case "SSetregB32":
                 case "SWaitcnt":

@@ -1431,6 +1431,12 @@ public static partial class Gen5SpirvTranslator
             {
                 return true;
             }
+            // S_SETPRIO only changes wave scheduling priority. Vulkan shaders
+            // cannot set it; wave scheduling remains under the host driver's control.
+            if (instruction.Opcode == "SSetprio")
+            {
+                return true;
+            }
             if (instruction.Opcode is
                 "SNop" or
                 "SSetregB32" or
