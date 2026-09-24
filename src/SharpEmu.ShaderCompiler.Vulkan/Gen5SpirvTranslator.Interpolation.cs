@@ -16,14 +16,45 @@ public static partial class Gen5SpirvTranslator
         private const uint InterpolateAtSample = 77;
         private const uint InterpolateAtOffset = 78;
 
+        private uint PixelInputControl(uint attribute) => attribute < (uint)_pixelInputCntl.Length
+            ? _pixelInputCntl[attribute]
+            : attribute;
+
+        private bool IsCustomPixelInput(uint attribute) => attribute < 32 &&
+            (_request.PixelCustomInterpolationMask & (1u << (int)attribute)) != 0;
+
+        private bool IsDefaultPixelInput(uint attribute) =>
+            (PixelInputControl(attribute) & 0x20u) != 0 && !IsCustomPixelInput(attribute);
+
+        private bool IsFlatPixelInput(uint attribute) =>
+            (PixelInputControl(attribute) & 0x400u) != 0 && !IsCustomPixelInput(attribute);
+
         private void DeclareInterpolationParameters()
         {
             foreach (var instruction in _request.Program.Instructions)
             {
                 if (instruction.Opcode == "VInterpMovF32" &&
-                    instruction.Control is Gen5InterpolationControl interpolation)
+                    instruction.Control is Gen5InterpolationControl interpolation &&
+                    !IsDefaultPixelInput(interpolation.Attribute))
                 {
                     _perVertexAttributes.Add(interpolation.Attribute);
+                }
+            }
+
+            var attributes = _request.Program.Instructions
+                .Select(instruction => instruction.Control)
+                .OfType<Gen5InterpolationControl>()
+                .Select(control => control.Attribute)
+                .Distinct()
+                .Where(attribute => !IsDefaultPixelInput(attribute));
+            foreach (var group in attributes.GroupBy(attribute => PixelInputControl(attribute) & 0x1Fu))
+            {
+                // One Vulkan input represents all aliases. Raw reads or mixed
+                // flat/smooth slots need per-vertex values for the whole group.
+                if (group.Any(_perVertexAttributes.Contains) ||
+                    group.Select(IsFlatPixelInput).Distinct().Count() > 1)
+                {
+                    _perVertexAttributes.UnionWith(group);
                 }
             }
 
@@ -89,8 +120,7 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
-            var custom = interpolation.Attribute < 32 &&
-                (_request.PixelCustomInterpolationMask & (1u << (int)interpolation.Attribute)) != 0;
+            var custom = IsCustomPixelInput(interpolation.Attribute);
 
             uint LoadVertex(uint vertex)
             {
@@ -117,16 +147,23 @@ public static partial class Gen5SpirvTranslator
                     error = "reserved interpolation parameter selector";
                     return false;
                 }
-                result = LoadParameter(mode);
+                result = IsFlatPixelInput(interpolation.Attribute) ? LoadVertex(0) : LoadParameter(mode);
             }
             else if (instruction.Opcode is "VInterpP1F32" or "VInterpP2F32")
             {
-                var firstPhase = instruction.Opcode == "VInterpP1F32";
-                var source = Bitcast(_floatType, GetRawSource(instruction, 0));
-                var product = _module.AddInstruction(SpirvOp.FMul, _floatType,
-                    LoadParameter(firstPhase ? 0u : 1u), source);
-                result = _module.AddInstruction(SpirvOp.FAdd, _floatType, product,
-                    firstPhase ? LoadParameter(2) : Bitcast(_floatType, LoadV(destination)));
+                if (IsFlatPixelInput(interpolation.Attribute))
+                {
+                    result = LoadVertex(0);
+                }
+                else
+                {
+                    var firstPhase = instruction.Opcode == "VInterpP1F32";
+                    var source = Bitcast(_floatType, GetRawSource(instruction, 0));
+                    var product = _module.AddInstruction(SpirvOp.FMul, _floatType,
+                        LoadParameter(firstPhase ? 0u : 1u), source);
+                    result = _module.AddInstruction(SpirvOp.FAdd, _floatType, product,
+                        firstPhase ? LoadParameter(2) : Bitcast(_floatType, LoadV(destination)));
+                }
             }
             else
             {

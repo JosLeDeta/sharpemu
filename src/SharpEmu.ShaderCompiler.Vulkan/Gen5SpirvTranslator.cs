@@ -856,13 +856,25 @@ public static partial class Gen5SpirvTranslator
                     .Distinct()
                     .Order()
                     .ToArray();
-                var locations = Gen5PixelInputMapping.ResolveLocations(
-                    _pixelInputCntl,
-                    attributes);
                 DeclareInterpolationParameters();
+                var inputsByLocation = new Dictionary<uint, uint>();
                 for (var index = 0; index < attributes.Length; index++)
                 {
                     var attribute = attributes[index];
+                    if (IsDefaultPixelInput(attribute))
+                    {
+                        continue;
+                    }
+
+                    var location = PixelInputControl(attribute) & 0x1Fu;
+                    if (inputsByLocation.TryGetValue(location, out var existing))
+                    {
+                        // Guest input slots can alias one VS export. Relocating an
+                        // alias would read a different, possibly unwritten parameter.
+                        _pixelInputs.Add(attribute, existing);
+                        continue;
+                    }
+
                     var variable = _module.AddGlobalVariable(
                         _perVertexAttributes.Contains(attribute)
                             ? _module.TypePointer(SpirvStorageClass.Input, _module.TypeArray(_vec4Type, 3))
@@ -870,23 +882,21 @@ public static partial class Gen5SpirvTranslator
                         SpirvStorageClass.Input);
                     // VINTRP ATTR selects the PS input slot. SPI_PS_INPUT_CNTL
                     // maps that slot to a VS parameter export location.
-                    var cntl = attribute < (uint)_pixelInputCntl.Length
-                        ? _pixelInputCntl[attribute]
-                        : attribute;
                     _module.AddDecoration(
                         variable,
                         SpirvDecoration.Location,
-                        locations[index]);
+                        location);
                     if (_perVertexAttributes.Contains(attribute))
                     {
                         _module.AddDecoration(variable, SpirvDecoration.PerVertexKhr);
                     }
-                    else if ((cntl & 0x400u) != 0)
+                    else if (IsFlatPixelInput(attribute))
                     {
                         _module.AddDecoration(variable, SpirvDecoration.Flat);
                     }
 
                     _pixelInputs.Add(attribute, variable);
+                    inputsByLocation.Add(location, variable);
                     _interfaces.Add(variable);
                 }
 
@@ -2158,8 +2168,24 @@ public static partial class Gen5SpirvTranslator
         {
             error = string.Empty;
             if (_stage != Gen5SpirvStage.Pixel ||
-                !_pixelInputs.TryGetValue(interpolation.Attribute, out var input) ||
+                interpolation.Channel > 3 ||
                 !TryGetVectorDestination(instruction, out var destination))
+            {
+                error = "invalid interpolated attribute";
+                return false;
+            }
+
+            if (IsDefaultPixelInput(interpolation.Attribute))
+            {
+                var defaultValue = (PixelInputControl(interpolation.Attribute) >> 8) & 3u;
+                var one = interpolation.Channel == 3
+                    ? (defaultValue & 1u) != 0
+                    : (defaultValue & 2u) != 0;
+                StoreV(destination, Bitcast(_uintType, Float(one ? 1 : 0)));
+                return true;
+            }
+
+            if (!_pixelInputs.TryGetValue(interpolation.Attribute, out var input))
             {
                 error = "invalid interpolated attribute";
                 return false;
