@@ -943,6 +943,10 @@ internal static unsafe partial class VulkanVideoPresenter
             return _imageCache.TryClearImageFromBuffer(address, size, packedClear);
         }
 
-        public bool TryAbsorbDccFill(ulong address, ulong size, uint fillValue) => _imageCache.TryAbsorbDccFill(address, size, fillValue);
+        public bool TryAbsorbDccFill(ulong address, ulong size, uint fillValue)
+        {
+            _ = BeginBatchedGuestCommands();
+            return _imageCache.TryAbsorbDccFill(address, size, fillValue);
+        }
     }
 }

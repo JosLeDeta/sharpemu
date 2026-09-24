@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.Libs.Gpu.Scheduling;
+using Silk.NET.Vulkan;
 
 namespace SharpEmu.Libs.Gpu.Images;
 
@@ -43,7 +44,7 @@ public sealed partial class GuestImageCache
     }
 
     // True when registered DCC absorbed the fill and the guest dispatch can be skipped.
-    public bool TryAbsorbDccFill(ulong address, ulong size, uint fillValue)
+    public unsafe bool TryAbsorbDccFill(ulong address, ulong size, uint fillValue)
     {
         if (!IsValidRange(address, size))
         {
@@ -78,10 +79,46 @@ public sealed partial class GuestImageCache
             found.ClearMask = dccClearMask;
             found.FillValue = fillValue;
             found.FillSize = size;
+            // A later color-target bind must not clear work written by a compute
+            // shader after this fill. Materialize the fixed zero clear at its
+            // position in the guest queue when the image is already resident.
+            if (code == 0x00 && dccClearMask != 0 && !_scheduler.Current.IsInvalid)
+            {
+                var command = _scheduler.Current;
+                var native = new CommandBuffer(command.Handle);
+                var cleared = false;
+                _slots.ForEach((identifier, image) =>
+                {
+                    if (!image.Registered || !image.Backing.Exists || image.DepthOwner.IsValid ||
+                        image.Description.Metadata.Kind != MetadataKind.Dcc ||
+                        image.Description.Metadata.Range.Address != address)
+                    {
+                        return;
+                    }
+
+                    WatchImage(identifier);
+                    ClearDccImage(image, native);
+                    cleared = true;
+                });
+                if (cleared)
+                {
+                    found.ClearMask = 0;
+                }
+            }
             return true;
         }
 
         return false;
+    }
+
+    private unsafe void ClearDccImage(CachedImage image, CommandBuffer native)
+    {
+        _scheduler.Current.EndRendering();
+        image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, native);
+        var clear = default(ClearColorValue);
+        var range = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, Vk.RemainingMipLevels, 0, image.Backing.Layers);
+        _device.Vk.CmdClearColorImage(native, image.Backing.Handle, ImageLayout.TransferDstOptimal, &clear, 1, &range);
+        TakeGpuOwnership(image);
     }
 
     public bool SetMetadataSlice(ulong address, uint slice, bool isClear)
