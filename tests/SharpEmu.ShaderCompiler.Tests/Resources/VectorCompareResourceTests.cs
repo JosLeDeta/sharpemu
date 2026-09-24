@@ -35,11 +35,15 @@ public sealed class VectorCompareResourceTests
     }
 
     [Theory]
-    [InlineData(false, false)]
-    [InlineData(false, true)]
-    [InlineData(true, false)]
-    [InlineData(true, true)]
-    public void CompareUpdatesOnlyItsDestinationMask(bool updatesExecutionMask, bool comparisonPasses)
+    [InlineData(false, false, 32u)]
+    [InlineData(false, true, 32u)]
+    [InlineData(true, false, 32u)]
+    [InlineData(true, true, 32u)]
+    [InlineData(false, false, 64u)]
+    [InlineData(false, true, 64u)]
+    [InlineData(true, false, 64u)]
+    [InlineData(true, true, 64u)]
+    public void CompareUpdatesOnlyItsDestinationMask(bool updatesExecutionMask, bool comparisonPasses, uint waveSize)
     {
         var program = Program(
             MoveScalar(0, 106, 0x12345678),
@@ -52,7 +56,7 @@ public sealed class VectorCompareResourceTests
             MoveScalarRegister(28, 11, 127),
             BufferLoad(32, 8),
             EndProgram(40));
-        var plan = Extract(program, userDataCount: 0);
+        var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, Hash, 0, 0, waveSize: waveSize);
 
         Assert.True(RuntimeValueEvaluator.EvaluateDescriptorSource(plan,
             Assert.Single(plan.Info.Buffers).Source, Inputs([]), out var descriptor));
@@ -60,7 +64,7 @@ public sealed class VectorCompareResourceTests
         Assert.Equal(new uint[]
         {
             updatesExecutionMask ? 0x12345678u : comparisonMask,
-            updatesExecutionMask ? 0x87654321u : 0u,
+            updatesExecutionMask || waveSize == 32 ? 0x87654321u : 0u,
             updatesExecutionMask ? comparisonMask : uint.MaxValue,
             0,
         }, descriptor.Dwords);

@@ -306,7 +306,8 @@ internal sealed class ShaderProgramCache
         {
             plan = ShaderResourcePlan.Extract(program, source.Stage, source.Hash, source.UserDataBase, (uint)source.UserData.Length,
                 fetch?.Loads.Select(load => load.Pc).ToHashSet(),
-                beforeResourceTracking: dumpPlanning ? resourcePlan => ShaderPlanningDump.WriteGraph(source, resourcePlan) : null);
+                beforeResourceTracking: dumpPlanning ? resourcePlan => ShaderPlanningDump.WriteGraph(source, resourcePlan) : null,
+                waveSize: options.ComputeInfo?.WaveSize ?? 32);
         }
         catch (ResourcePlanException exception)
         {

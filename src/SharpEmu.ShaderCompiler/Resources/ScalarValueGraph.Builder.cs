@@ -706,6 +706,22 @@ public sealed partial class ScalarValueGraph
         private void WriteMaskPair(RegisterState state, uint destinationRegister, ScalarValue low, ScalarValue high, ScalarValue mask)
         {
             state.WritePair(destinationRegister, low, high);
+            TrackMask(state, destinationRegister, mask);
+        }
+
+        private void WriteWaveMask(RegisterState state, uint destinationRegister, ScalarValue low, ScalarValue mask)
+        {
+            // In wave32 the adjacent SGPR can hold an unrelated resource pointer.
+            // This must match the register writes emitted by the shader backend.
+            if (_graph.WaveSize == 64)
+                state.WritePair(destinationRegister, low, _graph.Constant(0u));
+            else
+                state.WriteScalar(destinationRegister, low);
+            TrackMask(state, destinationRegister, mask);
+        }
+
+        private static void TrackMask(RegisterState state, uint destinationRegister, ScalarValue mask)
+        {
             switch (destinationRegister)
             {
                 case ExecLow:
@@ -1006,12 +1022,12 @@ public sealed partial class ScalarValueGraph
                 opcode is "VAddCoU32" or "VSubCoU32" or "VSubrevCoU32" or "VAddCoCiU32" or "VMadU64U32")
             {
                 var carry = value.IsUndefined ? _graph.Undefined(ScalarValueType.Bool) : state.CarryOut;
-                WriteMaskPair(state, carryDestination, _graph.Select(carry, _graph.Constant(1u), _graph.Constant(0u)), _graph.Constant(0u), carry);
+                WriteWaveMask(state, carryDestination, _graph.Select(carry, _graph.Constant(1u), _graph.Constant(0u)), carry);
             }
             else if (opcode is "VAddcU32" or "VSubbU32" or "VSubbrevU32" or "VAddCoU32" or "VSubCoU32" or "VSubrevCoU32")
             {
                 var carry = value.IsUndefined ? _graph.Undefined(ScalarValueType.Bool) : state.CarryOut;
-                WriteMaskPair(state, VccLow, _graph.Select(carry, _graph.Constant(1u), _graph.Constant(0u)), _graph.Constant(0u), carry);
+                WriteWaveMask(state, VccLow, _graph.Select(carry, _graph.Constant(1u), _graph.Constant(0u)), carry);
             }
 
             foreach (var destination in instruction.Destinations)
@@ -1241,18 +1257,18 @@ public sealed partial class ScalarValueGraph
             // Execution-mask comparisons leave the vector condition registers unchanged.
             if (updatesExecutionMask)
             {
-                WriteMaskPair(state, ExecLow, raw, _graph.Constant(0u), masked);
+                WriteWaveMask(state, ExecLow, raw, masked);
                 return;
             }
 
             var scalarDestination = instruction.Destinations.FirstOrDefault(destination => destination.Kind == Gen5OperandKind.ScalarRegister);
             if (scalarDestination.Kind == Gen5OperandKind.ScalarRegister && instruction.Destinations.Count != 0)
             {
-                WriteMaskPair(state, scalarDestination.Value, raw, _graph.Constant(0u), masked);
+                WriteWaveMask(state, scalarDestination.Value, raw, masked);
             }
             else
             {
-                WriteMaskPair(state, VccLow, raw, _graph.Constant(0u), masked);
+                WriteWaveMask(state, VccLow, raw, masked);
             }
         }
 

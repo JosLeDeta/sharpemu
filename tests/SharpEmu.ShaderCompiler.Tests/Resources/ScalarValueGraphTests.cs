@@ -10,6 +10,33 @@ namespace SharpEmu.ShaderCompiler.Tests.Resources;
 
 public sealed class ScalarValueGraphTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Wave32VectorMaskPreservesAdjacentResourcePointer(bool carry)
+    {
+        var instruction = carry
+            ? Vop3(8, "VAddCoU32", 2, Gen5Operand.Vector(0), Gen5Operand.Vector(1)) with
+            {
+                Control = new Gen5Vop3Control(0, 0, 0, false, 0, 13),
+            }
+            : Vopc(8, "VCmpNeU32", Gen5Operand.Vector(0), 1) with
+            {
+                Destinations = [Gen5Operand.Scalar(13)],
+            };
+        var plan = Extract(Program(
+            MoveScalar(0, 14, 0x1000), MoveScalar(4, 15, 0),
+            instruction,
+            ScalarLoad(16, 14, destination: 4),
+            MoveScalar(24, 5, 0), MoveScalar(28, 6, 16), MoveScalar(32, 7, 0),
+            BufferLoad(36, 4), EndProgram(44)));
+        var memory = new TestWordMemory { Words = new uint[16] };
+        memory.At(0x1000) = 0xFEEDBEEF;
+
+        Assert.True(RuntimeValueEvaluator.FlattenResourceTable(plan, Inputs([], memory.Read), out var table));
+        Assert.Equal([0xFEEDBEEFu], table);
+    }
+
     private static Gen5ShaderInstruction[] Descriptor(uint pc, uint register, uint dword1, uint dword2, uint dword3) =>
     [
         MoveScalar(pc, register + 1, dword1),
