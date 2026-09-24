@@ -271,7 +271,23 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var image = _imageCache.GetImage(depth.Image);
-            return new DepthAttachmentAcquisition(view, image.Backing.Samples, metadataClear);
+            if (metadataClear)
+            {
+                // HTile clears the depth view, independently of the other attachments.
+                // A load-op clear would be clipped to the rendering area, which can
+                // be smaller when a color attachment has a different extent.
+                EndRendering();
+                var command = BeginBatchedGuestCommands();
+                var depthView = resolution.Request.View;
+                var range = new SubresourceRange(depthView.BaseLevel, depthView.LevelCount, depthView.BaseLayer, depthView.LayerCount);
+                image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, range, command);
+                var vkRange = new ImageSubresourceRange(ImageAspectFlags.DepthBit,
+                    depthView.BaseLevel, depthView.LevelCount, depthView.BaseLayer, depthView.LayerCount);
+                var clear = new ClearDepthStencilValue(depth.Target.State.DepthClearValue, 0);
+                _vk.CmdClearDepthStencilImage(command, image.Backing.Handle, ImageLayout.TransferDstOptimal, &clear, 1, &vkRange);
+            }
+
+            return new DepthAttachmentAcquisition(view, image.Backing.Samples, false);
         }
 
         // The image transition ends the scope only when it records a barrier.
