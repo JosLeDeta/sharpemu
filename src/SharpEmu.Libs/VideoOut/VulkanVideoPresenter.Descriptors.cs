@@ -476,6 +476,12 @@ internal static unsafe partial class VulkanVideoPresenter
                     throw SubmissionScheduler.Fatal($"A device-address range is outside the cache: handle={range.Handle} base=0x{range.Base:X16} size=0x{range.Size:X} hash=0x{program.Hash:X16}.");
                 }
 
+                // Unmapped read-only pointers resolve to zero through the page table.
+                if (!range.Written && !_guestMemory.CanRead(range.Base, 1))
+                {
+                    continue;
+                }
+
                 var size = ClampMappedSize(range.Base, range.Size);
                 if (range.Written)
                 {
