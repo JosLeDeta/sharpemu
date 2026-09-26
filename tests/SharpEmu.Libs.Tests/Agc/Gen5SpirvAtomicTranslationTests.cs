@@ -115,24 +115,35 @@ public sealed class Gen5SpirvAtomicTranslationTests
         Assert.Contains((ushort)SpirvOp.ULessThan, opcodes);
     }
 
-    [Fact]
-    public void DataShareWaveCounters_InVertexStageUseWaveCountAndBroadcast()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DataShareWaveCounters_InVertexStageUseWaveCountAndBroadcast(bool global)
     {
+        var gdsBit = global ? 1u << 17 : 0u;
         var opcodes = CompileVertexOpcodes(
             [
-                0xD8FA0014, 0x07000000,
-                0xD8F60014, 0x08000000,
+                0xD8F80014 | gdsBit, 0x07000000,
+                0xD8F40014 | gdsBit, 0x08000000,
             ]);
 
-        // Private graphics storage applies the counter once per active wave.
+        // GDS uses shared atomics; graphics LDS uses private storage.
         // Each active lane receives the value from before the update.
         Assert.Contains((ushort)SpirvOp.GroupNonUniformBallot, opcodes);
         Assert.Contains((ushort)SpirvOp.BitCount, opcodes);
         Assert.Contains((ushort)SpirvOp.GroupNonUniformShuffle, opcodes);
         Assert.Contains((ushort)SpirvOp.IAdd, opcodes);
-        Assert.Contains((ushort)SpirvOp.ISub, opcodes);
-        Assert.DoesNotContain((ushort)SpirvOp.AtomicIAdd, opcodes);
-        Assert.DoesNotContain((ushort)SpirvOp.AtomicISub, opcodes);
+        if (global)
+        {
+            Assert.Contains((ushort)SpirvOp.AtomicIAdd, opcodes);
+            Assert.Contains((ushort)SpirvOp.AtomicISub, opcodes);
+        }
+        else
+        {
+            Assert.Contains((ushort)SpirvOp.ISub, opcodes);
+            Assert.DoesNotContain((ushort)SpirvOp.AtomicIAdd, opcodes);
+            Assert.DoesNotContain((ushort)SpirvOp.AtomicISub, opcodes);
+        }
     }
 
     [Fact]

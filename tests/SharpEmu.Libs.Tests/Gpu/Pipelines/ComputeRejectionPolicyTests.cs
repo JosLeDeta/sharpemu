@@ -67,19 +67,41 @@ public sealed class ComputeRejectionPolicyTests
         }
     }
 
-    [Fact]
-    public void FailedResourceReadsRemainFatalWithSkippingEnabled()
+    [Theory]
+    [InlineData(null)]
+    [InlineData("0")]
+    [InlineData("1")]
+    public void UnmappedScalarReadsRespectStrictPolicyWithSkippingEnabled(string? value)
     {
-        using var fatal = new FatalScope();
-        var guest = new PipelineTestGuest();
-        guest.RegisterProgram(CodeAddress, HeaderAddress,
-            [0xF4080000, 0xFA000000, 0xE0000000, 0x80000000, 0xBF810000]);
-        var source = guest.Source(CodeAddress, ShaderStage.Compute, new uint[2]);
-        var cursor = 0u;
-        var failure = Assert.Throws<SchedulerFatalException>(() => guest.Programs.TryGetProgram(
-            source, PipelineTestGuest.ComputeOptions(1), false, ref cursor, out _, out _, out _));
-        Assert.Contains("could not be materialized", failure.Message);
-        Assert.Empty(guest.Compiler.Requests);
+        const string scalarVariable = "SHARPEMU_STRICT_SCALAR_LOAD";
+        var previous = Environment.GetEnvironmentVariable(scalarVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable(scalarVariable, value);
+            using var fatal = new FatalScope();
+            var guest = new PipelineTestGuest();
+            guest.RegisterProgram(CodeAddress, HeaderAddress,
+                [0xF4080000, 0xFA000000, 0xE0000000, 0x80000000, 0xBF810000]);
+            var source = guest.Source(CodeAddress, ShaderStage.Compute, new uint[2]);
+            var cursor = 0u;
+            bool Lookup() => guest.Programs.TryGetProgram(
+                source, PipelineTestGuest.ComputeOptions(1), false, ref cursor, out _, out _, out _);
+            if (value == "1")
+            {
+                var failure = Assert.Throws<SchedulerFatalException>(() => Lookup());
+                Assert.Contains("could not be materialized", failure.Message);
+                Assert.Empty(guest.Compiler.Requests);
+            }
+            else
+            {
+                Assert.True(Lookup());
+                Assert.Single(guest.Compiler.Requests);
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(scalarVariable, previous);
+        }
     }
 
     [Fact]
